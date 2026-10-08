@@ -1,0 +1,35 @@
+{
+  "name": "canton-lending",
+  "private": true,
+  "description": "Canton Lending Protocol: pooled lending on Canton Network",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "doctor": "sh scripts/doctor.sh",
+    "dev": "pnpm -r --parallel --filter ./backend --filter ./frontend dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm -r test",
+    "daml:build": "sh scripts/daml.sh build",
+    "daml:test": "sh scripts/daml.sh test",
+    "devnet": "python3 scripts/devnet.py",
+    "demo:bitsafe": "sh scripts/demo-bitsafe.sh",
+    "demo:bitsafe:localnet": "bash deploy/bitsafe-localnet/all.sh"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "eslint": "^10.0.0",
+    "eslint-plugin-react-hooks": "^7.0.0",
+    "globals": "^16.0.0",
+    "prettier": "^3.9.0",
+    "typescript": "~6.0.0",
+    "typescript-eslint": "^8.71.0"
+  },
+  "type": "module"
+}

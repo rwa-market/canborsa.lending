@@ -1,0 +1,9 @@
+[Unit]
+Description=Canton Lending: host health snapshot every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target

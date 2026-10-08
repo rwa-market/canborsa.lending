@@ -1,0 +1,9 @@
+# run artifacts of the demo (stop-nodes.sh removes them)
+nodes/
+state-*.json
+input-*.json
+proposal-*.json
+propose-*.json
+result-*.json
+*.log
+traffic-*/

@@ -1,0 +1,198 @@
+-- | 1.0.2 audit fixes (docs/architecture/adr-009-compound-v3.md, D46): whole-stock purchases,
+-- the supplier share capped at utilization 1, one-flag pauses, the debt valued at no less than 1 USD
+-- for a borrow, the delay for a bigger absorb penalty.
+module Test.Lending.AuditFixesTest where
+
+import DA.Time (days, seconds)
+import Daml.Script
+
+import Lending.Governance
+import Lending.Math
+import Lending.Pause
+import Lending.Pool
+import Lending.Risk (discountedPrice)
+import Lending.Types
+import Test.Lending.Env
+import Test.Lending.ExamplesTest (eqN, failsWith, tryUser)
+import Test.Lending.GovernanceTest (Council (..), propose, setupCouncil)
+import Test.Lending.TestnetRegression (approve, proposeFull)
+
+-- | Bob borrows 600 USDCx against 0.0123456789 CBTC; at $70 000 he is absorbed.
+cbtcStock : Script Env
+cbtcStock = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.0123456789)
+  run env env.bob (borrowCmd env env.bob 600.0)
+  setPrice env env.cbtc 70001.0
+  absorb env env.bob
+  pure env
+
+-- USDCx for the whole stock, rounded up to the token's 10 decimals, as the contract computes it
+wholeCostOf : Env -> MarketId -> Script Decimal
+wholeCostOf env marketId = do
+  (_, config) <- currentConfig env
+  m <- marketOf env marketId
+  mp <- marketParamsFor env marketId
+  let price = discountedPrice config.params mp 70001.0
+  pure (ceilDecimal (divUp (mulUp m.protocolCollateral price) 1.0))
+
+-- Audit backend H1: paying the whole cost buys the whole CBTC stock; before, one token unit stayed
+test_wholeStockPurchase : Script ()
+test_wholeStockPurchase = do
+  env <- cbtcStock
+  m <- marketOf env "CBTC"
+  assertMsg "stock held" (m.protocolCollateral == 0.0123456789)
+  cost <- wholeCostOf env "CBTC"
+  mint env env.usdcx env.liquidator 1000.0
+  -- a unit more than the whole stock costs is rejected; a partial buy under 1 USDCx too
+  failsWith "pays more than the whole stock costs"
+    (tryUser env env.liquidator (buyCmd env env.liquidator "CBTC" (cost + 0.0000000001) 0.0))
+  failsWith "a purchase is at least 1 USDCx"
+    (tryUser env env.liquidator (buyCmd env env.liquidator "CBTC" 0.5 0.0))
+  -- the whole cost buys the whole stock: no rest of one token unit
+  run env env.liquidator (buyCmd env env.liquidator "CBTC" cost 0.0123456789)
+  m' <- marketOf env "CBTC"
+  eqN "nothing left" 0.0 m'.protocolCollateral
+  eqN "book value zero" 0.0 m'.protocolCollateralBasis
+  balanceOf env.liquidator env.cbtc >>= eqD "bought the whole stock" 0.0123456789
+
+-- Audit Daml H2: a dust deposit does not take the interest that belongs to reserves
+test_supplierShareCapped : Script ()
+test_supplierShareCapped = do
+  env <- setup
+  addReserves env 15000.0
+  run env env.alice (supplyCmd env env.alice 5000.0)
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 4000.0)
+  -- Alice leaves: debt 4 000 is above the supply; Carol keeps 1 USDCx
+  run env env.alice (withdrawAllCmd env env.alice)
+  mint env env.usdcx env.carol 1.0
+  run env env.carol (supplyCmd env env.carol 1.0)
+  reservesBefore <- poolReserves env
+  passTime (days 30)
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd poolCid Pool_Accrue with configCid
+  carol <- balanceFor env env.carol
+  -- U is capped at 1: about 1 × 70% × 30/365 × 0.8 = 0.046 USDCx, not ~190
+  assertMsg ("Carol earns at most the capped rate, got " <> show carol) (carol < 1.05)
+  reservesAfter <- poolReserves env
+  assertMsg "reserves keep the rest of the interest" (reservesAfter - reservesBefore > 150.0)
+
+-- Audit frontend H1: a pause changes one flag; another pause stays
+test_pauseOneFlag : Script ()
+test_pauseOneFlag = do
+  env <- setup
+  (cid, _) <- currentPause env
+  cid' <- submit env.guardian $ exerciseCmd cid PauseState_SetFlag with flag = BorrowFlag; paused = True
+  cid'' <- submit env.guardian $ exerciseCmd cid' PauseState_SetFlag with flag = BuyFlag; paused = True
+  Some p <- queryContractId env.operator cid''
+  assertMsg "both pauses on" (p.flags.borrowPaused && p.flags.buyPaused)
+  assertMsg "the others untouched"
+    (not p.flags.absorbPaused && not p.flags.supplyWithdrawPaused && not p.flags.collateralWithdrawPaused)
+  submitMustFail env.operator $ exerciseCmd cid'' PauseState_SetFlag with flag = BuyFlag; paused = False
+
+-- Audit Daml L2: a borrow values the debt at no less than 1 USD, as a collateral withdrawal does
+test_borrowDebtAtLeastOneDollar : Script ()
+test_borrowDebtAtLeastOneDollar = do
+  env <- setup
+  seedLiquidity env 10000.0
+  -- 20 000 CC at $0.20 × 0.30 = capacity $1 200; USDCx quoted at 0.985 (within the peg)
+  run env env.carol (depositCmd env env.carol "CC" 20000.0)
+  setPrice env env.usdcx 0.985
+  mustFail env env.carol (borrowCmd env env.carol 1200.0000000001)
+  run env env.carol (borrowCmd env env.carol 1200.0)
+
+-- Audit ops: a lower liquidationFactor (bigger penalty) waits 2 days like a lower liquidation point
+test_biggerPenaltyWaits : Script ()
+test_biggerPenaltyWaits = do
+  env <- setup
+  c <- setupCouncil env
+  p <- propose env c c.m1 "lf-90" (\m -> m with liquidationFactor = 0.9)
+  p' <- submit c.m2 $ exerciseCmd p Proposal_Approve with approver = c.m2
+  (configCid, _) <- currentConfig env
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+  passTime (days 2 - seconds 1)
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+  passTime (seconds 1)
+  _ <- submit c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "penalty raised after the delay" (mp.liquidationFactor == 0.9)
+
+-- Review 03.10, item 1: a borrow of exactly a limit passes once the debt index has left 1
+test_borrowExactlyAtLimits : Script ()
+test_borrowExactlyAtLimits = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  passTime (days 30)
+  refreshPrices env
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd poolCid Pool_Accrue with configCid
+  m <- currentPoolIndex env
+  assertMsg "the debt index moved" (m > 1.0)
+  -- the per-user cap: 5 000 (CC collateral: the CBTC attestation is a month old by now)
+  mint env env.cc env.carol 100000.0
+  run env env.carol (depositCmd env env.carol "CC" 100000.0)
+  mustFail env env.carol (borrowCmd env env.carol 5000.0000000001)
+  run env env.carol (borrowCmd env env.carol 5000.0)
+  -- the collateral limit: 20 000 CC × $0.20 × 0.30 = 1 200
+  dave <- allocateParty "Dave"
+  mint env env.cc dave 20000.0
+  openAccount env dave
+  run env dave (depositCmd env dave "CC" 20000.0)
+  mustFail env dave (borrowCmd env dave 1200.0000000001)
+  run env dave (borrowCmd env dave 1200.0)
+
+currentPoolIndex : Env -> Script N
+currentPoolIndex env = (.borrowIndex) <$> poolState env
+
+-- Review 03.10, item 14: a new guardian gets the pause flags in the same transaction as the role
+-- change; the old guardian never keeps them
+test_guardianChangeRebindsPause : Script ()
+test_guardianChangeRebindsPause = do
+  env <- setup
+  c <- setupCouncil env
+  newGuardian <- allocateParty "NewGuardian"
+  (configCid, config) <- currentConfig env
+  p <- proposeFull env c c.m1 "new-guardian" identity (Some (config.roles with guardian = newGuardian))
+  p' <- approve c.m2 p
+  (pauseCid, _) <- currentPause env
+  _ <- submit env.operator $ exerciseCmd p' Proposal_ExecuteTrusted with configCid; pauseCid = Some pauseCid
+  [(pauseCid', pause)] <- query @PauseState env.operator
+  assertMsg "flags rebound to the new guardian at once" (pause.guardian == newGuardian)
+  submitMustFail env.guardian $ exerciseCmd pauseCid' PauseState_SetFlag with flag = BorrowFlag; paused = True
+  _ <- submit newGuardian $ exerciseCmd pauseCid' PauseState_SetFlag with flag = BorrowFlag; paused = True
+  -- a role change that keeps the guardian leaves the flags alone, even with the pause passed in
+  newOracle <- allocateParty "NewOracle"
+  (configCid1, config1) <- currentConfig env
+  q <- proposeFull env c c.m1 "new-oracle" identity (Some (config1.roles with oracle = newOracle))
+  q' <- approve c.m2 q
+  [(pauseCid1, _)] <- query @PauseState env.operator
+  _ <- submit env.operator $ exerciseCmd q' Proposal_ExecuteTrusted with configCid = configCid1; pauseCid = Some pauseCid1
+  [(pauseCid2, _)] <- query @PauseState env.operator
+  assertMsg "pause untouched" (pauseCid2 == pauseCid1)
+
+-- Review 03.10, item 1 at the pool cap: a borrow of exactly the room left under totalBorrowCap
+-- passes once the debt index has left 1
+test_borrowExactlyAtPoolCap : Script ()
+test_borrowExactlyAtPoolCap = do
+  env <- setup
+  seedLiquidity env 20000.0
+  -- move the debt index, then leave no debt behind
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  passTime (days 30)
+  refreshPrices env
+  mint env env.usdcx env.bob 100.0
+  run env env.bob (repayAllCmd env env.bob 2000.0)
+  idx <- currentPoolIndex env
+  assertMsg "the debt index moved" (idx > 1.0)
+  updateParams env (\p -> p with totalBorrowCap = 1200.0) []
+  mint env env.cc env.carol 100000.0
+  run env env.carol (depositCmd env env.carol "CC" 100000.0)
+  mustFail env env.carol (borrowCmd env env.carol 1200.0000000001)
+  run env env.carol (borrowCmd env env.carol 1200.0)

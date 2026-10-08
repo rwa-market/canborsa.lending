@@ -1,0 +1,238 @@
+-- | Account under a Loop wallet (0.7.0). Loop does not execute third-party DARs: its user
+-- cannot call a protocol choice themselves. So the account is custodial, like the EVM wallet one
+-- (ADR-004): Account and LoopWallet belong to the protocol's custodial party, the tokens sit
+-- as its holdings, user shares are tracked by LoopWallet.balances.
+--
+-- The user signs each operation with the key of their external Loop party (Ed25519,
+-- provider.signMessage). Daml 3.5 has no Ed25519 check, so THE BACKEND VERIFIES THE SIGNATURE
+-- off-ledger, before sending the command; trust in the custodian here is wider than on the EVM path, where
+-- the contract itself checks secp256k1. The contract checks what it can:
+--   * key: publicKey is the raw Ed25519 key, its Canton fingerprint equals the party namespace
+--     (party = "<hint>::<fingerprint>"), see loopFingerprint;
+--   * message: signedMessage matches the text the contract builds from the operation
+--     arguments (evmMessage: network, operator, party, action, nonce, expiry), so the signed
+--     text cannot be swapped for another operation;
+--   * replay and expiry: nonce equals LoopWallet.nonce and increases, the expiry has not passed and is no further than
+--     30 minutes away.
+-- signedMessage and signature stay in the exercise arguments in the ledger history (audit).
+--
+-- Separate module: templates in Lending.Evm would change the generated EvmWallet names.
+module Lending.Loop
+  ( LoopWallet (..)
+  , LoopWallet_Receive (..)
+  , LoopWallet_ReceiveAttributed (..)
+  , LoopWallet_ReclaimTransferOut (..)
+  , LoopWallet_DropInstrument (..)
+  , LoopDirectory (..)
+  , LoopDirectory_Open (..)
+  , loopMessage
+  , loopDepositReason
+  , checkLoopDepositReason
+  , loopFingerprint
+  , partyNamespace
+  , isEd25519Key
+  , validLoopKey
+  , consumeLoopSignature
+  , debitLoop
+  , maxLoopSignatureLength
+  ) where
+
+import DA.Action (unless)
+import DA.Crypto.Text (sha256)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Set (Set)
+import DA.Set qualified as Set
+import DA.Text qualified as T
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.MetadataV1 (ExtraArgs, Metadata (..))
+import Splice.Api.Token.TransferInstructionV1
+
+import Lending.Account (Account (..))
+import Lending.Config (ProtocolConfig, governedConfig, requireInstrumentDelisted)
+import Lending.Evm (acceptIncoming, credit, debitIn, depositReasonKey, evmMessage, maxSignatureTtl)
+import Lending.Token (verifyReceived)
+
+-- | Loop user's wallet: party, key, signature nonce and shares in the custodian's holdings.
+-- Visible to the operator and the custodian; the Loop party itself does not see it (it is not a stakeholder).
+template LoopWallet
+  with
+    operator : Party
+    custody : Party
+      -- ^ party that owns the holdings and the user's Account
+    party : Text
+      -- ^ id of the external Loop party as text, "<hint>::1220<64 hex>"
+    publicKey : Text
+      -- ^ the party's raw Ed25519 key, 64 lowercase hex
+    network : Text
+      -- ^ Canton network in the signed message, e.g. canton:devnet
+    nonce : Int
+      -- ^ the next signature must carry this nonce
+    balances : Map InstrumentId Decimal
+      -- ^ the user's free tokens, which the custodian holds as holdings
+  where
+    signatory operator, custody
+    ensure validLoopKey party publicKey && network /= "" && nonce >= 0
+      && all (>= 0.0) (Map.values balances)
+
+    -- | Credit an incoming transfer (faucet, transfer from another party) to the wallet.
+    -- No user signature is needed: the user only receives tokens.
+    choice LoopWallet_Receive : ContractId LoopWallet
+      with
+        instructionCid : ContractId TransferInstruction
+        extraArgs : ExtraArgs
+      controller custody
+      do
+        t <- acceptIncoming custody instructionCid extraArgs (\_ -> pure ())
+        create this with balances = credit t.instrumentId t.amount balances
+
+    -- | 0.8.0: drop the balance of an instrument the council removed with its market (Delisting_Execute).
+    choice LoopWallet_DropInstrument : ContractId LoopWallet
+      with
+        governors : [Party]
+        configCid : ContractId ProtocolConfig
+        instrument : InstrumentId
+      controller operator :: governors
+      do
+        config <- governedConfig operator governors configCid
+        requireInstrumentDelisted config instrument
+        unless (Map.member instrument balances) (abort "no balance of this instrument")
+        create this with balances = Map.delete instrument balances
+
+    -- | Credit an incoming transfer only if its reason points to this wallet:
+    -- meta["splice.lfdecentralizedtrust.org/reason"] == "lending:loop:<party>".
+    choice LoopWallet_ReceiveAttributed : ContractId LoopWallet
+      with
+        instructionCid : ContractId TransferInstruction
+        extraArgs : ExtraArgs
+      controller custody
+      do
+        t <- acceptIncoming custody instructionCid extraArgs \t ->
+          either abort pure (checkLoopDepositReason party t.meta)
+        create this with balances = credit t.instrumentId t.amount balances
+
+    -- | Withdraw this wallet's outgoing transfer that the receiver did not accept (EvmTransferOut via
+    -- Pool_LoopWalletExecute returned an instruction): the holdings and the amount return to the balance.
+    choice LoopWallet_ReclaimTransferOut : ContractId LoopWallet
+      with
+        instructionCid : ContractId TransferInstruction
+        extraArgs : ExtraArgs
+      controller custody
+      do
+        instruction <- fetch instructionCid
+        let t = (view instruction).transfer
+        unless (t.sender == custody) (abort "transfer was not sent by the custody party")
+        unless (checkLoopDepositReason party t.meta == Right ())
+          (abort "transfer was not sent from this Loop wallet")
+        result <- exercise instructionCid TransferInstruction_Withdraw with extraArgs
+        case result.output of
+          TransferInstructionResult_Failed -> pure ()
+          _ -> abort "withdrawn transfer did not return the tokens"
+        verifyReceived t.instrumentId custody t.amount result.senderChangeCids
+        create this with balances = credit t.instrumentId t.amount balances
+
+-- | Registry of the custodial party's Loop accounts (0.7.0): one Account and one LoopWallet per
+-- Loop party. Signed by the operator and the custodian, visible only to them.
+template LoopDirectory
+  with
+    operator : Party
+    custody : Party
+    network : Text
+      -- ^ Canton network in signed messages, e.g. canton:devnet
+    parties : Set Text
+  where
+    signatory operator, custody
+    ensure operator /= custody && network /= ""
+
+    -- | Open an account for a Loop party. The backend checks the party signature (challenge) at login;
+    -- the contract checks that the key is this party's key (fingerprint = namespace). The account is empty
+    -- and does nothing without a signature, so the operator opens it.
+    choice LoopDirectory_Open : (ContractId LoopDirectory, ContractId Account, ContractId LoopWallet)
+      with
+        party : Text
+        publicKey : Text
+      controller operator
+      do
+        unless (isEd25519Key publicKey) (abort "Loop public key must be 64 lowercase hex characters (raw Ed25519)")
+        unless (validLoopKey party publicKey) (abort "Loop public key fingerprint does not match the party namespace")
+        unless (not (Set.member party parties)) (abort "Loop account already exists")
+        accountCid <- create Account with
+          operator; owner = custody; principal = 0.0; collateral = Map.empty
+          evmAddress = None; loopParty = Some party
+        walletCid <- create LoopWallet with
+          operator; custody; party; publicKey; network; nonce = 0; balances = Map.empty
+        directoryCid <- create this with parties = Set.insert party parties
+        pure (directoryCid, accountCid, walletCid)
+
+-- | Text the user signs in Loop (provider.signMessage). Same format
+-- as EVM (evmMessage); in the Account line, the Loop party id:
+--   Canton Lending
+--   <action string, actionLine>
+--   Account: <party>
+--   Network: <network>
+--   Operator: <operator>
+--   Nonce: <nonce>
+--   Expires: <expiresAt, 2030-01-01T00:00:00Z>
+loopMessage : Text -> Party -> Text -> Text -> Int -> Time -> Text
+loopMessage = evmMessage
+
+-- | Reason of a deposit to a party's wallet: lending:loop:<party>.
+loopDepositReason : Text -> Text
+loopDepositReason party = "lending:loop:" <> party
+
+checkLoopDepositReason : Text -> Metadata -> Either Text ()
+checkLoopDepositReason party meta = case TextMap.lookup depositReasonKey meta.values of
+  None -> Left "incoming transfer has no deposit reason"
+  Some reason
+    | reason == loopDepositReason party -> Right ()
+    | otherwise -> Left "deposit reason does not match this Loop wallet"
+
+-- | Canton key fingerprint: SHA-256 multihash with purpose 12 (PublicKeyFingerprint):
+-- "1220" ++ hex(sha256(00 00 00 0c ++ key)). For Ed25519 the raw 32-byte key is hashed
+-- (Canton documentation vector, external-signing-topology: base64 key
+-- 2RwUiIHVUVdulxzD8NKtPmIaaBqMer1A90rDjoklJPY= → 1220205057e3…caaa; test LoopTest).
+loopFingerprint : Text -> Text
+loopFingerprint key = "1220" <> sha256 ("0000000c" <> key)
+
+-- | Namespace of party "<hint>::<namespace>". None: not a party id.
+partyNamespace : Text -> Optional Text
+partyNamespace party = case T.splitOn "::" party of
+  [hint, ns] | hint /= "" && ns /= "" -> Some ns
+  _ -> None
+
+-- | Raw Ed25519 key: 32 bytes, 64 lowercase hex.
+isEd25519Key : Text -> Bool
+isEd25519Key k = T.length k == 64 && all (`elem` T.explode "0123456789abcdef") (T.explode k)
+
+-- | The key is this party's namespace key.
+validLoopKey : Text -> Text -> Bool
+validLoopKey party key = isEd25519Key key && partyNamespace party == Some (loopFingerprint key)
+
+-- | Length limit for the signature in text (hex or base64 Ed25519: 88–128 chars, with headroom).
+maxLoopSignatureLength : Int
+maxLoopSignatureLength = 1024
+
+-- | Check the nonce, expiry and operation text and return the wallet with the next nonce (the contract
+-- is archived). The Ed25519 signature itself cannot be checked here (Daml has no Ed25519): the backend
+-- checks it against LoopWallet.publicKey and signedMessage before sending the command.
+consumeLoopSignature
+  : Party -> Party -> ContractId LoopWallet -> Text -> Text -> Text -> Int -> Time -> Update LoopWallet
+consumeLoopSignature operator custody walletCid line signedMessage signature nonce expiresAt = do
+  wallet <- fetch walletCid
+  unless (wallet.operator == operator) (abort "Loop wallet of another operator")
+  unless (wallet.custody == custody) (abort "Loop wallet of another custody party")
+  now <- getTime
+  unless (now <= expiresAt) (abort "Loop signature expired")
+  unless (expiresAt <= addRelTime now maxSignatureTtl) (abort "Loop signature lifetime exceeds 30 minutes")
+  unless (nonce == wallet.nonce) (abort "Loop signature nonce is stale: sign the operation again")
+  unless (signature /= "" && T.length signature <= maxLoopSignatureLength && T.trim signature == signature)
+    (abort "Loop signature must be non-empty, without spaces at the ends, up to 1024 characters")
+  unless (signedMessage == loopMessage wallet.network operator wallet.party line nonce expiresAt)
+    (abort "Loop signed message does not match the operation")
+  archive walletCid
+  pure wallet with nonce = wallet.nonce + 1
+
+debitLoop : InstrumentId -> Decimal -> Map InstrumentId Decimal -> Update (Map InstrumentId Decimal)
+debitLoop = debitIn "Loop wallet"

@@ -1,0 +1,67 @@
+-- | USDCx withdrawal to Ethereum (0.6.0, real assets): a burn request in xReserve.
+-- Opened by Pool_EvmWalletExecute (EvmRedeem) with the wallet signature.
+module Lending.EvmRedeem
+  ( RedeemRequest (..)
+  , RedeemRequest_Complete (..)
+  , RedeemRequest_Refund (..)
+  , redeemDecimals
+  ) where
+
+import DA.Action (unless)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Lending.Evm (EvmWallet (..), credit, isEvmAddress)
+
+-- | Decimal places in an xReserve withdrawal amount: burn accepts up to 6.
+redeemDecimals : Int
+redeemDecimals = 6
+
+-- | Request to withdraw USDCx to Ethereum (0.6.0). The amount is already debited from EvmWallet, the holdings are with
+-- the custodian. The backend bot burns them with BridgeUserAgreement_Burn (reference = requestId) and
+-- closes the request: success is Complete, failure is Refund, returning the amount to the wallet.
+template RedeemRequest
+  with
+    operator : Party
+    custody : Party
+    address : Text
+      -- ^ EVM address of the wallet the amount was debited from
+    instrumentId : InstrumentId
+      -- ^ the pool's debt instrument (USDCx); Refund returns it
+    amount : Decimal
+    ethAddress : Text
+      -- ^ USDC recipient in Ethereum, 0x and 40 lowercase hex
+    requestId : Text
+    createdAt : Time
+  where
+    signatory operator, custody
+    ensure amount > 0.0
+      && roundCommercial redeemDecimals amount == amount
+      && isEvmAddress address
+      && isEvmAddress ethAddress
+      && requestId /= ""
+
+    -- | The burn in xReserve went through: the request is closed, the amount went to Ethereum.
+    choice RedeemRequest_Complete : ()
+      with
+        burnReference : Text
+          -- ^ id of the burn transaction or contract, for audit
+      controller custody
+      do unless (burnReference /= "") (abort "burn reference required")
+
+    -- | The burn failed: return the amount to the address's wallet. Called by the custodian or the operator.
+    choice RedeemRequest_Refund : ContractId EvmWallet
+      with
+        actor : Party
+        walletCid : ContractId EvmWallet
+        reason : Text
+      controller actor
+      do
+        unless (actor == custody || actor == operator) (abort "only the custody party or the operator refunds a redeem")
+        unless (reason /= "") (abort "refund reason required")
+        wallet <- fetch walletCid
+        unless (wallet.operator == operator) (abort "EVM wallet of another operator")
+        unless (wallet.custody == custody) (abort "EVM wallet of another custody party")
+        unless (wallet.address == address) (abort "EVM wallet of another address")
+        archive walletCid
+        create wallet with balances = credit instrumentId amount wallet.balances
+

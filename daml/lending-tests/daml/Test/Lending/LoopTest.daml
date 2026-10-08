@@ -1,0 +1,441 @@
+-- | Account under a Loop wallet (lending-core-v2). The backend verifies the Ed25519 signature; the contract checks
+-- the party key (fingerprint = namespace), the operation text, nonce and expiry. So the signature here is
+-- any non-empty text, and the Loop party is a text with the namespace from the Canton docs key.
+module Test.Lending.LoopTest where
+
+import DA.Assert ((===))
+import DA.Numeric (cast)
+import DA.Map qualified as Map
+import DA.Optional (fromSome, isSome)
+import DA.Set qualified as Set
+import DA.Text qualified as T
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, minutes, time)
+import DA.Date (Month (..), date)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as H
+import Splice.Api.Token.MetadataV1 (Metadata (..), emptyMetadata)
+import Splice.Api.Token.TransferInstructionV1
+import Splice.Testing.Tokens.TestTokenV1 (TokenTransferOffer (..))
+
+import Lending.Account
+import Lending.Evm (EvmAction (..), actionLine)
+import Lending.Evm qualified as Evm
+import Lending.Loop
+import Lending.Math (N)
+import Lending.Pool
+import Lending.Types (MarketId)
+import Test.Lending.Env
+
+-- | Ed25519 key from the Canton docs (external-signing-topology): base64
+-- 2RwUiIHVUVdulxzD8NKtPmIaaBqMer1A90rDjoklJPY=, fingerprint from the same page.
+loopKey : Text
+loopKey = "d91c148881d551576e971cc3f0d2ad3e621a681a8c7abd40f74ac38e892524f6"
+
+testParty : Text
+testParty = "loopuser::1220205057e331cc8929dd217e2f8e63f503b7081773de60d01fb46839700bc5caaa"
+
+-- | Second key (32 bytes 0x11) and its party: fingerprint computed outside Daml (python hashlib).
+otherKey : Text
+otherKey = T.implode (replicate 64 "1")
+
+otherParty : Text
+otherParty = "other::12200205734e0ef4afadcf3873cafbb4b8954912a4eb6c11123340ab170e4302e477"
+
+expiry : Time
+expiry = time (date 1970 Jan 1) 0 20 0
+
+data LoopEnv = LoopEnv with env : Env; custody : Party; receiver : Party
+
+setupLoop : Script LoopEnv
+setupLoop = do
+  env <- setupWith (\n -> allocatePartyByHint (PartyIdHint ("L" <> n)))
+  custody <- allocatePartyByHint (PartyIdHint "LoopCustody")
+  receiver <- allocatePartyByHint (PartyIdHint "LReceiver")
+  directoryCid <- submit (actAs [env.operator, custody]) $ createCmd LoopDirectory with
+    operator = env.operator; custody; network = "canton:test"; parties = Set.empty
+  _ <- submit env.operator $ exerciseCmd directoryCid LoopDirectory_Open with
+    party = testParty; publicKey = loopKey
+  seedLiquidity env 20000.0
+  pure LoopEnv with ..
+
+walletOf : LoopEnv -> Script (ContractId LoopWallet, LoopWallet)
+walletOf e = do
+  ws <- queryFilter @LoopWallet e.custody (\w -> w.party == testParty)
+  case ws of
+    [w] -> pure w
+    _ -> abort "expected exactly one LoopWallet"
+
+loopAccountOf : LoopEnv -> Script (ContractId Account, Account)
+loopAccountOf e = do
+  as <- queryFilter @Account e.env.operator (\a -> a.loopParty == Some testParty)
+  case as of
+    [a] -> pure a
+    _ -> abort "expected exactly one Loop Account"
+
+directoryOf : LoopEnv -> Script (ContractId LoopDirectory)
+directoryOf e = do
+  [(cid, _)] <- query @LoopDirectory e.env.operator
+  pure cid
+
+-- | The registry offers a transfer to the custodian with meta; the custodian has not accepted it yet.
+offer : LoopEnv -> H.InstrumentId -> Decimal -> Metadata -> Script (ContractId TransferInstruction)
+offer e instrumentId amount meta = do
+  now <- getTime
+  offerCid <- submit instrumentId.admin $ createCmd TokenTransferOffer with
+    transfer = Transfer with
+      sender = instrumentId.admin; receiver = e.custody; amount; instrumentId
+      requestedAt = now; executeBefore = addRelTime now (minutes 60)
+      inputHoldingCids = []; meta
+  pure (toInterfaceContractId @TransferInstruction offerCid)
+
+receive : LoopEnv -> H.InstrumentId -> Decimal -> Script ()
+receive e instrumentId amount = do
+  instructionCid <- offer e instrumentId amount emptyMetadata
+  (walletCid, _) <- walletOf e
+  _ <- submit e.custody $ exerciseCmd walletCid LoopWallet_Receive with
+    instructionCid; extraArgs = noExtraArgs
+  pure ()
+
+reasonMeta : Text -> Metadata
+reasonMeta value = Metadata with values = TextMap.fromList [("splice.lfdecentralizedtrust.org/reason", value)]
+
+-- | Signed operation: the text the user would sign in Loop.
+data LoopSigned = LoopSigned with signedMessage : Text; signature : Text; nonce : Int; expiresAt : Time
+
+signedFor : LoopEnv -> EvmAction -> Int -> LoopSigned
+signedFor e action n = LoopSigned with
+  signedMessage = loopMessage "canton:test" e.env.operator testParty (actionLine "USDCx" action) n expiry
+  signature = "ed25519-signature-checked-by-backend"
+  nonce = n
+  expiresAt = expiry
+
+type LoopResult = (Optional (ContractId Pool), Optional (ContractId Account), ContractId LoopWallet, Optional (ContractId TransferInstruction))
+
+-- | Pool_LoopWalletExecute command. Pool operations carry every price, as the backend sends them.
+loopCmd : LoopEnv -> EvmAction -> LoopSigned -> Script (Commands LoopResult)
+loopCmd e action s = do
+  let env = e.env
+  (configCid, config) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (pauseCid, _) <- currentPause env
+  (walletCid, _) <- walletOf e
+  (accountCid, _) <- loopAccountOf e
+  prices <- allPrices env
+  let collateralOf' m = (fromSome (Map.lookup m config.marketParams)).collateralInstrument
+  transfer <- case action of
+    EvmSupply{} -> Some <$> transferArgs e.custody env.usdcx
+    EvmDepositCollateral with marketId -> Some <$> transferArgs e.custody (collateralOf' marketId)
+    EvmWithdraw{} -> Some <$> transferArgs env.operator env.usdcx
+    EvmBorrow{} -> Some <$> transferArgs env.operator env.usdcx
+    EvmWithdrawCollateral with marketId -> Some <$> transferArgs env.operator (collateralOf' marketId)
+    EvmTransferOut with instrumentId -> Some <$> transferArgs e.custody instrumentId
+    _ -> pure None
+  let accountArg = case action of
+        EvmTransferOut{} -> None
+        _ -> Some accountCid
+  pure $ exerciseCmd poolCid Pool_LoopWalletExecute with
+    custody = e.custody; configCid; pauseCid; walletCid; accountCid = accountArg; action
+    signedMessage = s.signedMessage; signature = s.signature; nonce = s.nonce; expiresAt = s.expiresAt
+    prices; transfer
+
+loopAs : Party -> LoopEnv -> EvmAction -> LoopSigned -> Script (Either SubmitError LoopResult)
+loopAs submitter e action s = do
+  cmd <- loopCmd e action s
+  ds <- disclosures e.env
+  trySubmit (actAs submitter <> readAs e.custody <> discloseMany ds) cmd
+
+runLoop : LoopEnv -> EvmAction -> Int -> Script LoopResult
+runLoop e action n = loopAs e.custody e action (signedFor e action n) >>= either (\err -> abort (show err)) pure
+
+expectFail : Text -> Either SubmitError a -> Script ()
+expectFail expected r = case r of
+  Left err -> unless' (expected `T.isInfixOf` show err) ("expected '" <> expected <> "', got " <> show err)
+  Right _ -> abort ("expected failure: " <> expected)
+
+failLoop : LoopEnv -> EvmAction -> LoopSigned -> Text -> Script ()
+failLoop e action s expected = loopAs e.custody e action s >>= expectFail expected
+
+unless' : Bool -> Text -> Script ()
+unless' ok msg = if ok then pure () else abort msg
+
+balance : LoopEnv -> H.InstrumentId -> Script Decimal
+balance e i = do
+  (_, w) <- walletOf e
+  pure (Evm.balanceOf i w.balances)
+
+nonceOf : LoopEnv -> Script Int
+nonceOf e = (.nonce) . snd <$> walletOf e
+
+-- Pure functions: fingerprint against the Canton vector, message text ----------------------
+
+test_loopVector : Script ()
+test_loopVector = do
+  loopFingerprint loopKey === "1220205057e331cc8929dd217e2f8e63f503b7081773de60d01fb46839700bc5caaa"
+  loopFingerprint otherKey === "12200205734e0ef4afadcf3873cafbb4b8954912a4eb6c11123340ab170e4302e477"
+  partyNamespace testParty === Some "1220205057e331cc8929dd217e2f8e63f503b7081773de60d01fb46839700bc5caaa"
+  partyNamespace "no-namespace" === None
+  partyNamespace "::1220ab" === None
+  partyNamespace "a::b::c" === None
+  validLoopKey testParty loopKey === True
+  validLoopKey testParty otherKey === False
+  validLoopKey otherParty otherKey === True
+  -- key case and length
+  validLoopKey testParty (T.asciiToUpper loopKey) === False
+  validLoopKey testParty (T.drop 2 loopKey) === False
+  let operator = fromSome (partyFromText "Operator::1220abcd")
+  loopMessage "canton:devnet" operator testParty (actionLine "USDCx" (EvmSupply with amount = 100.0; full = False)) 0
+      (time (date 2030 Jan 1) 0 0 0)
+    === "Canton Lending\nSupply 100.0 USDCx\nAccount: loopuser::1220205057e331cc8929dd217e2f8e63f503b7081773de60d01fb46839700bc5caaa\nNetwork: canton:devnet\nOperator: Operator::1220abcd\nNonce: 0\nExpires: 2030-01-01T00:00:00Z"
+  loopDepositReason testParty === "lending:loop:loopuser::1220205057e331cc8929dd217e2f8e63f503b7081773de60d01fb46839700bc5caaa"
+
+-- Account opening -------------------------------------------------------------------------
+
+test_loopOpen : Script ()
+test_loopOpen = do
+  e <- setupLoop
+  let operator = e.env.operator
+  (_, w) <- walletOf e
+  w.nonce === 0
+  w.publicKey === loopKey
+  w.network === "canton:test"
+  (_, a) <- loopAccountOf e
+  a.owner === e.custody
+  a.evmAddress === None
+  a.principal === 0.0
+  -- a second time for the same party: no
+  directoryCid <- directoryOf e
+  trySubmit operator (exerciseCmd directoryCid LoopDirectory_Open with party = testParty; publicKey = loopKey)
+    >>= expectFail "Loop account already exists"
+  -- key not of this party
+  trySubmit operator (exerciseCmd directoryCid LoopDirectory_Open with party = otherParty; publicKey = loopKey)
+    >>= expectFail "fingerprint does not match the party namespace"
+  trySubmit operator (exerciseCmd directoryCid LoopDirectory_Open with party = otherParty; publicKey = T.asciiToUpper loopKey)
+    >>= expectFail "64 lowercase hex"
+  trySubmit operator (exerciseCmd directoryCid LoopDirectory_Open with party = otherParty; publicKey = T.drop 2 otherKey)
+    >>= expectFail "64 lowercase hex"
+  -- only the operator opens
+  trySubmit (actAs e.custody <> readAs operator) (exerciseCmd directoryCid LoopDirectory_Open with party = otherParty; publicKey = otherKey)
+    >>= expectFail "Authorization failure"
+  -- another party opens, it has its own wallet
+  _ <- submit operator $ exerciseCmd directoryCid LoopDirectory_Open with party = otherParty; publicKey = otherKey
+  ws <- query @LoopWallet e.custody
+  length ws === 2
+  [(_, d)] <- query @LoopDirectory operator
+  d.parties === Set.fromList [testParty, otherParty]
+  -- LoopWallet cannot be created bypassing the registry with someone else's key (ensure)
+  trySubmit (actAs [operator, e.custody]) (createCmd LoopWallet with
+      operator; custody = e.custody; party = testParty; publicKey = otherKey; network = "canton:test"
+      nonce = 0; balances = Map.empty)
+    >>= expectFail "Template precondition violated"
+
+-- Crediting -------------------------------------------------------------------------------
+
+test_loopReceive : Script ()
+test_loopReceive = do
+  e <- setupLoop
+  let env = e.env
+  receive e env.usdcx 1000.0
+  receive e env.cbtc 0.05
+  balance e env.usdcx >>= (=== 1000.0)
+  balance e env.cbtc >>= (=== 0.05)
+  balanceOf e.custody env.usdcx >>= (=== 1000.0)
+  -- crediting without a signature does not spend a nonce
+  nonceOf e >>= (=== 0)
+  -- only the custodian accepts
+  instructionCid <- offer e env.usdcx 5.0 emptyMetadata
+  (walletCid, _) <- walletOf e
+  trySubmit (actAs env.operator <> readAs e.custody) (exerciseCmd walletCid LoopWallet_Receive with instructionCid; extraArgs = noExtraArgs)
+    >>= expectFail "Authorization failure"
+  -- by reason: only "lending:loop:<party>"
+  trySubmit e.custody (exerciseCmd walletCid LoopWallet_ReceiveAttributed with instructionCid; extraArgs = noExtraArgs)
+    >>= expectFail "no deposit reason"
+  wrong <- offer e env.usdcx 5.0 (reasonMeta (loopDepositReason otherParty))
+  trySubmit e.custody (exerciseCmd walletCid LoopWallet_ReceiveAttributed with instructionCid = wrong; extraArgs = noExtraArgs)
+    >>= expectFail "does not match this Loop wallet"
+  right <- offer e env.usdcx 5.0 (reasonMeta (loopDepositReason testParty))
+  _ <- submit e.custody $ exerciseCmd walletCid LoopWallet_ReceiveAttributed with instructionCid = right; extraArgs = noExtraArgs
+  balance e env.usdcx >>= (=== 1005.0)
+
+-- End-to-end scenario: every operation ------------------------------------------------------
+
+test_loopFullFlow : Script ()
+test_loopFullFlow = do
+  e <- setupLoop
+  let env = e.env
+  receive e env.usdcx 1000.0
+  receive e env.cbtc 0.05
+
+  (poolCid, _) <- currentPool env
+  (newPool, newAccount, _, pending) <- runLoop e (EvmSupply with amount = 500.0; full = False) 0
+  -- a pool operation recreates the pool: the old one is gone
+  isSome newPool === True
+  isSome newAccount === True
+  pending === None
+  queryContractId env.operator poolCid >>= (=== None) . fmap (const ())
+  balance e env.usdcx >>= (=== 500.0)
+  accountBalance' e >>= (=== 500.0)
+
+  _ <- runLoop e (EvmDepositCollateral with marketId = "CBTC"; amount = 0.05) 1
+  balance e env.cbtc >>= (=== 0.0)
+  collateral' e "CBTC" >>= (=== 0.05)
+
+  -- a borrow takes the deposit first: 500 of deposit, then 1 000 of debt
+  _ <- runLoop e (EvmBorrow with amount = 1500.0) 2
+  balance e env.usdcx >>= (=== 2000.0)
+  accountBalance' e >>= (=== -1000.0)
+
+  _ <- runLoop e (EvmSupply with amount = 1010.0; full = True) 3
+  balance e env.usdcx >>= (=== 1000.0)
+  accountBalance' e >>= (=== 0.0)
+
+  _ <- runLoop e (EvmWithdrawCollateral with marketId = "CBTC"; amount = 0.05) 4
+  balance e env.cbtc >>= (=== 0.05)
+  _ <- runLoop e (EvmSupply with amount = 500.0; full = False) 5
+  _ <- runLoop e (EvmWithdraw with amount = 1.0; full = True) 6
+  balance e env.usdcx >>= (=== 1000.0)
+
+  -- withdrawal to a Canton party: the pool does not change, the transfer awaits the receiver with the wallet's reason
+  (poolCid, _) <- currentPool env
+  let send = EvmTransferOut with instrumentId = env.usdcx; amount = 100.0; receiver = e.receiver
+  (p, a, _, pending) <- runLoop e send 7
+  p === None
+  a === None
+  (poolCid', _) <- currentPool env
+  poolCid' === poolCid
+  balance e env.usdcx >>= (=== 900.0)
+  let instructionCid = fromSome pending
+  Some iv <- queryInterfaceContractId @TransferInstruction e.receiver instructionCid
+  iv.transfer.sender === e.custody
+  iv.transfer.amount === 100.0
+  TextMap.lookup "splice.lfdecentralizedtrust.org/reason" iv.transfer.meta.values === Some (loopDepositReason testParty)
+  _ <- submit e.receiver $ exerciseCmd instructionCid TransferInstruction_Accept with extraArgs = noExtraArgs
+  balanceOf e.receiver env.usdcx >>= (=== 100.0)
+
+  nonceOf e >>= (=== 8)
+  balanceOf e.custody env.usdcx >>= (=== 900.0)
+
+collateral' : LoopEnv -> MarketId -> Script Decimal
+collateral' e marketId = do
+  (_, a) <- loopAccountOf e
+  pure (castN (collateralOf marketId a))
+
+accountBalance' : LoopEnv -> Script Decimal
+accountBalance' e = do
+  (_, pool) <- currentPool e.env
+  (_, a) <- loopAccountOf e
+  pure (castN (accountBalance pool.state a))
+
+castN : N -> Decimal
+castN = cast
+
+-- | Withdrawal not accepted: the custodian recalls it, the amount returns to the wallet.
+test_loopReclaimTransferOut : Script ()
+test_loopReclaimTransferOut = do
+  e <- setupLoop
+  let env = e.env
+  receive e env.usdcx 1000.0
+  (_, _, _, pending) <- runLoop e (EvmTransferOut with instrumentId = env.usdcx; amount = 100.0; receiver = e.receiver) 0
+  balance e env.usdcx >>= (=== 900.0)
+  (walletCid, _) <- walletOf e
+  _ <- submit e.custody $ exerciseCmd walletCid LoopWallet_ReclaimTransferOut with
+    instructionCid = fromSome pending; extraArgs = noExtraArgs
+  balance e env.usdcx >>= (=== 1000.0)
+  balanceOf e.custody env.usdcx >>= (=== 1000.0)
+
+-- Rejections ------------------------------------------------------------------------------
+
+test_loopRejects : Script ()
+test_loopRejects = do
+  e <- setupLoop
+  let env = e.env
+  receive e env.usdcx 1000.0
+  let supply = EvmSupply with amount = 500.0; full = False
+      ok = signedFor e supply 0
+  -- a different text was signed: amount, nonce in the text, network
+  failLoop e (EvmSupply with amount = 600.0; full = False) ok "signed message does not match the operation"
+  failLoop e supply (ok with signedMessage = T.replace "canton:test" "canton:main" ok.signedMessage)
+    "signed message does not match the operation"
+  -- wrong nonce (both in the text and in the argument)
+  failLoop e supply (signedFor e supply 1) "nonce is stale"
+  -- empty signature
+  failLoop e supply (ok with signature = "") "Loop signature must be non-empty"
+  -- expiry more than 30 minutes ahead
+  let far = addRelTime expiry (minutes 20)
+  failLoop e supply (ok with
+      expiresAt = far
+      signedMessage = loopMessage "canton:test" env.operator testParty (actionLine "USDCx" supply) 0 far)
+    "lifetime exceeds 30 minutes"
+  -- the controller is only the custodian
+  loopAs env.operator e supply ok >>= expectFail "Authorization failure"
+  loopAs env.alice e supply ok >>= expectFail "Authorization failure"
+  -- another party's custodian under this wallet
+  otherCustody <- allocatePartyByHint (PartyIdHint "LOtherCustody")
+  ds <- disclosures env
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (pauseCid, _) <- currentPause env
+  (walletCid, _) <- walletOf e
+  (accountCid, _) <- loopAccountOf e
+  payment <- transferArgs e.custody env.usdcx
+  trySubmit (actAs otherCustody <> readAs e.custody <> discloseMany ds) (exerciseCmd poolCid Pool_LoopWalletExecute with
+      custody = otherCustody; configCid; pauseCid; walletCid; accountCid = Some accountCid; action = supply
+      signedMessage = ok.signedMessage; signature = ok.signature; nonce = 0; expiresAt = expiry
+      prices = noPrices; transfer = Some payment)
+    >>= expectFail "Loop wallet of another custody party"
+  -- without an account or without holdings
+  trySubmit (actAs e.custody <> discloseMany ds) (exerciseCmd poolCid Pool_LoopWalletExecute with
+      custody = e.custody; configCid; pauseCid; walletCid; accountCid = None; action = supply
+      signedMessage = ok.signedMessage; signature = ok.signature; nonce = 0; expiresAt = expiry
+      prices = noPrices; transfer = Some payment)
+    >>= expectFail "account required"
+  -- withdrawal to Ethereum is closed for Loop
+  let redeem = EvmRedeem with amount = 10.0; ethAddress = "0x1111111111111111111111111111111111111111"; requestId = "r-1"
+  failLoop e redeem (signedFor e redeem 0) "not available for Loop wallets"
+  -- regular choices do not move a Loop account
+  r <- trySubmit (actAs e.custody <> discloseMany ds) $ exerciseCmd poolCid Pool_SupplyBase with
+    user = e.custody; configCid; accountCid; amount = 500.0; full = False; payment
+  expectFail "needs the Loop wallet signature" r
+  -- a valid signature passes, a replay does not
+  _ <- runLoop e supply 0
+  failLoop e supply ok "nonce is stale"
+  -- overspend: more than the wallet's free balance
+  let deposit = EvmDepositCollateral with marketId = "CBTC"; amount = 0.05
+  failLoop e deposit (signedFor e deposit 1) "insufficient CBTC in the Loop wallet"
+  let big = EvmSupply with amount = 600.0; full = False
+  failLoop e big (signedFor e big 1) "insufficient USDCx in the Loop wallet"
+  let bigSend = EvmTransferOut with instrumentId = env.usdcx; amount = 501.0; receiver = e.receiver
+  failLoop e bigSend (signedFor e bigSend 1) "insufficient USDCx in the Loop wallet"
+  let selfSend = EvmTransferOut with instrumentId = env.usdcx; amount = 1.0; receiver = e.custody
+  failLoop e selfSend (signedFor e selfSend 1) "receiver must not be the custody party"
+  -- expired signature
+  passTime (minutes 21)
+  let send = EvmTransferOut with instrumentId = env.usdcx; amount = 1.0; receiver = e.receiver
+  failLoop e send (signedFor e send 1) "Loop signature expired"
+  -- nothing went out, the nonce is spent only by a successful operation
+  balance e env.usdcx >>= (=== 500.0)
+  nonceOf e >>= (=== 1)
+
+-- | One Loop party's wallet does not move another party's account.
+test_loopOtherAccount : Script ()
+test_loopOtherAccount = do
+  e <- setupLoop
+  let env = e.env
+  receive e env.usdcx 1000.0
+  directoryCid <- directoryOf e
+  _ <- submit env.operator $ exerciseCmd directoryCid LoopDirectory_Open with party = otherParty; publicKey = otherKey
+  [(otherAccountCid, _)] <- queryFilter @Account env.operator (\a -> a.loopParty == Some otherParty)
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (walletCid, _) <- walletOf e
+  payment <- transferArgs e.custody env.usdcx
+  ds <- disclosures env
+  (pauseCid, _) <- currentPause env
+  let supply = EvmSupply with amount = 500.0; full = False
+      s = signedFor e supply 0
+  trySubmit (actAs e.custody <> discloseMany ds) (exerciseCmd poolCid Pool_LoopWalletExecute with
+      custody = e.custody; configCid; pauseCid; walletCid; accountCid = Some otherAccountCid; action = supply
+      signedMessage = s.signedMessage; signature = s.signature; nonce = 0; expiresAt = expiry
+      prices = noPrices; transfer = Some payment)
+    >>= expectFail "Loop wallet belongs to another account"

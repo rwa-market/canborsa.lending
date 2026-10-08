@@ -1,0 +1,33 @@
+-- | Test implementation of the Featured App API (splice-api-featured-app-v1) for sandbox:
+-- on DevNet and MainNet the DSO issues the right; the protocol contract works with the interface.
+module Test.Lending.MockRewards where
+
+import Splice.Api.FeaturedAppRightV1
+
+template MockFeaturedAppRight
+  with
+    dso : Party
+    provider : Party
+  where
+    signatory dso
+    observer provider
+
+    interface instance FeaturedAppRight for MockFeaturedAppRight where
+      view = FeaturedAppRightView with dso; provider
+      featuredAppRight_CreateActivityMarkerImpl _ arg = do
+        cids <- forA arg.beneficiaries \b -> toInterfaceContractId <$> create MockActivityMarker with
+          dso; provider; beneficiary = b.beneficiary; weight = b.weight
+        pure FeaturedAppRight_CreateActivityMarkerResult with activityMarkerCids = cids
+
+template MockActivityMarker
+  with
+    dso : Party
+    provider : Party
+    beneficiary : Party
+    weight : Decimal
+  where
+    signatory provider
+    observer dso
+
+    interface instance FeaturedAppActivityMarker for MockActivityMarker where
+      view = FeaturedAppActivityMarkerView with dso; provider; beneficiary; weight

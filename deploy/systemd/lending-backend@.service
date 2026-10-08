@@ -1,0 +1,57 @@
+# Backend in two slots: blue (:3001) and green (:3002). A deploy starts the free slot,
+# nginx switches traffic, the old slot stops. Bots run on the lease holder.
+# Audit I-2, I-14: a separate lending user without sudo and without write access to the code,
+# built JS instead of tsx, systemd isolation. Secrets: /etc/lending/backend.env (root, 0600):
+# systemd reads it, the backend process only gets the environment variables.
+[Unit]
+Description=Canton Lending: backend (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=lending
+Group=lending
+WorkingDirectory=/opt/lending/slots/%i/backend
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/lending/backend.env
+# per-role ledger credentials are placed by the operator on the server (root, 0600), not by CI (audit I-6)
+EnvironmentFile=-/etc/lending/ledger-credentials.env
+EnvironmentFile=/etc/lending/slot-%i.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+MemoryHigh=700M
+MemoryMax=900M
+
+# Isolation
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/lending/shared/data /opt/lending/shared/tokens /opt/lending/run
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

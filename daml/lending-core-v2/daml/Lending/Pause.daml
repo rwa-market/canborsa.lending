@@ -1,0 +1,70 @@
+-- | Pause flags in their own contract (K7, risk 13). The guardian sees it directly and replaces
+-- it without touching the pool, so a pause does not compete with user operations for the pool
+-- contract and does not need the operator's backend. Pool operations read it (fetch); a read does
+-- not block the guardian's replacement.
+--
+-- Signed by the operator, the guardian is an observer and the controller: as a signatory the
+-- guardian's node would confirm every pool operation that reads the flags. The pool checks that the
+-- operator and the guardian match the config (contract keys do not exist in Canton 3).
+module Lending.Pause where
+
+import DA.Action (unless)
+
+import Lending.Config
+import Lending.Types
+
+template PauseState
+  with
+    operator : Party
+    guardian : Party
+    flags : PauseFlags
+  where
+    signatory operator
+    observer guardian
+    ensure operator /= guardian
+
+    choice PauseState_Set : ContractId PauseState
+      with
+        newFlags : PauseFlags
+      controller guardian
+      do create this with flags = newFlags
+
+    -- | 1.0.2: change one flag. The guardian signs only what it changes: a stale or tampered view
+    -- of the other four flags cannot undo another pause (audit, frontend H1).
+    choice PauseState_SetFlag : ContractId PauseState
+      with
+        flag : PauseFlag
+        paused : Bool
+      controller guardian
+      do create this with flags = setFlag flag paused flags
+
+    -- | Rebind the flags to a new guardian after a council role change; the flags carry over.
+    choice PauseState_Rebind : ContractId PauseState
+      with
+        configCid : ContractId ProtocolConfig
+      controller operator
+      do
+        config <- fetch configCid
+        unless (config.roles.operator == operator) (abort "config belongs to another operator")
+        unless (config.roles.guardian /= guardian) (abort "guardian unchanged")
+        create this with guardian = config.roles.guardian
+
+-- | One of the five pause flags (1.0.2).
+data PauseFlag = BorrowFlag | CollateralWithdrawFlag | SupplyWithdrawFlag | AbsorbFlag | BuyFlag
+  deriving (Eq, Show)
+
+setFlag : PauseFlag -> Bool -> PauseFlags -> PauseFlags
+setFlag flag v f = case flag of
+  BorrowFlag -> f with borrowPaused = v
+  CollateralWithdrawFlag -> f with collateralWithdrawPaused = v
+  SupplyWithdrawFlag -> f with supplyWithdrawPaused = v
+  AbsorbFlag -> f with absorbPaused = v
+  BuyFlag -> f with buyPaused = v
+
+-- | The pool's pause flags: the same operator and the config's guardian.
+loadPause : Party -> ProtocolConfig -> ContractId PauseState -> Update PauseFlags
+loadPause operator config pauseCid = do
+  p <- fetch pauseCid
+  unless (p.operator == operator) (abort "pause flags of another operator")
+  unless (p.guardian == config.roles.guardian) (abort "pause flags of another guardian")
+  pure p.flags

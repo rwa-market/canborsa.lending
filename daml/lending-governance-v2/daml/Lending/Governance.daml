@@ -1,0 +1,598 @@
+-- | k-of-n council for protocol parameters (T4.1.1, BitSafe challenge).
+-- The council is signed by the operator and all members. After Council_Adopt the protocol config
+-- is signed by the same membership: neither the operator nor part of the council can change parameters bypassing
+-- a proposal that gathered threshold approvals.
+--
+-- Audit S9: a proposal has an expiry and base parameters, so a stale proposal
+-- does not roll back a newer decision. Audit, low: only the author can withdraw a proposal.
+--
+-- Re-audit H1: the trusted factory and the Featured App right are exercised with the operator's
+-- authority, so they are changed not by the council threshold alone but by the threshold together with the operator
+-- (Proposal_ExecuteTrusted). By threshold (Proposal_Execute): only market and protocol
+-- parameters and removal of the Featured App right (H2).
+--
+-- 0.4.0, audit D-5, A-13:
+-- - the trusted path requires the threshold, not all members: a lost key of one member no longer
+--   blocks rotation of the registry factory forever. The operator signature stays mandatory;
+-- - roles (oracle, guardian, treasury, backstop, liquidators) are changed by a proposal via the
+--   trusted path: a new oracle or liquidator gets access to the pool's money;
+-- - council membership and threshold change via CouncilRotation: the old council's threshold approves,
+--   new members join with their signature, config, pool and council change atomically.
+--   The same template with an empty old council forms the first council from external parties;
+-- - a market's reserve attestation cannot be switched off by threshold (audit D-10), only via the trusted path.
+-- Audit N4: reserves are withdrawn to treasury by an IncomeProposal.
+-- 0.8.0: a collateral asset is removed by a MarketDelistingProposal.
+module Lending.Governance where
+
+import DA.Foldable (forA_)
+import DA.Foldable qualified as F
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.List (unique)
+import DA.Optional (isNone)
+import DA.Time (RelTime, addRelTime, days)
+
+import Lending.Account (Account, Account_DropMarket (..))
+import Lending.Config
+import Lending.Evm (EvmWallet, EvmWallet_DropInstrument (..))
+import Lending.Loop (LoopWallet, LoopWallet_DropInstrument (..))
+import Lending.Pause (PauseState, PauseState_Rebind (..))
+import Lending.Pool
+import Lending.Token (TransferArgs)
+import Lending.Types
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+
+template GovernanceCouncil
+  with
+    operator : Party
+    members : [Party]
+    threshold : Int
+  where
+    signatory operator, members
+    ensure threshold >= 1 && threshold <= length members && unique members
+      && operator `notElem` members
+
+    -- | Hand the config and the pool over to council management.
+    nonconsuming choice Council_Adopt : (ContractId ProtocolConfig, ContractId Pool)
+      with
+        configCid : ContractId ProtocolConfig
+        poolCid : ContractId Pool
+      controller operator
+      do
+        config <- fetch configCid
+        pool <- fetch poolCid
+        require "config belongs to another operator" (config.roles.operator == operator)
+        require "pool belongs to another operator" (pool.operator == operator)
+        require "config already governed" (null config.governors)
+        configCid' <- exercise configCid Config_SetGovernors with newGovernors = members
+        poolCid' <- exercise poolCid Pool_SetGovernors with newGovernors = members
+        pure (configCid', poolCid')
+
+    nonconsuming choice Council_Propose : ContractId ParameterChangeProposal
+      with
+        proposer : Party
+        proposalId : Text
+        description : Text
+        configCid : ContractId ProtocolConfig
+          -- ^ config the change is computed against
+        newParams : ProtocolParams
+        newMarketParams : Map MarketId MarketParams
+        newTransferFactories : Optional TransferFactories
+        expiresAt : Time
+        featuredAppRightChange : Optional FeaturedRightChange
+          -- ^ None: leave as is; removing: by threshold; setting: Proposal_ExecuteTrusted
+        newRoles : Optional Roles
+          -- ^ 0.4.0, audit D-5: None: leave as is; Some: only Proposal_ExecuteTrusted
+      controller proposer
+      do
+        require "proposer is not a council member" (proposer `elem` members)
+        now <- getTime
+        require "proposal must expire in the future" (expiresAt > now)
+        base <- fetch configCid
+        require "config is not governed by this council" (base.governors == members)
+        forA_ newRoles \r -> require "operator cannot change" (r.operator == operator)
+        require "a lower liquidation factor waits 2 days: the proposal must expire later"
+          (not (lowersLiquidationFactor base.marketParams newMarketParams)
+            || expiresAt > addRelTime now liquidationFactorDelay)
+        create ParameterChangeProposal with
+          operator; members; threshold; proposalId; description; proposer
+          baseParams = base.params
+          baseMarketParams = base.marketParams
+          newParams; newMarketParams; newTransferFactories; expiresAt
+          approvals = [proposer]
+          baseTransferFactories = Some base.transferFactories
+          featuredAppRightChange
+          newRoles
+          baseRoles = Some base.roles
+          proposedAt = now
+
+    -- | Propose a new council membership and threshold (audit D-5). Executed by Rotation_Execute
+    -- after threshold approvals of the old council and signatures of all new members.
+    nonconsuming choice Council_ProposeRotation : ContractId CouncilRotation
+      with
+        proposer : Party
+        rotationId : Text
+        newMembers : [Party]
+        newThreshold : Int
+        expiresAt : Time
+      controller proposer
+      do
+        require "proposer is not a council member" (proposer `elem` members)
+        now <- getTime
+        require "rotation must expire in the future" (expiresAt > now)
+        create CouncilRotation with
+          operator; members; threshold; rotationId; proposer; newMembers; newThreshold; expiresAt
+          approvals = [proposer]
+          joined = []
+
+    -- | Propose withdrawing reserves to treasury (audit N4, K6).
+    nonconsuming choice Council_ProposeIncome : ContractId IncomeProposal
+      with
+        proposer : Party
+        proposalId : Text
+        treasury : Party
+        reservesAmount : Decimal
+        expiresAt : Time
+      controller proposer
+      do
+        require "proposer is not a council member" (proposer `elem` members)
+        now <- getTime
+        require "proposal must expire in the future" (expiresAt > now)
+        require "amount must be positive" (reservesAmount > 0.0)
+        create IncomeProposal with
+          operator; members; threshold; proposalId; proposer; treasury; reservesAmount; expiresAt
+          approvals = [proposer]
+
+    -- | Propose a new collateral market (0.5.0). Executed by the operator after threshold approvals
+    -- (MarketListing_Execute): a new instrument and its factory are the trusted path, like a factory change.
+    nonconsuming choice Council_ProposeMarket : ContractId MarketListingProposal
+      with
+        proposer : Party
+        proposalId : Text
+        marketId : MarketId
+        market : MarketParams
+        factory : ContractId TransferFactory
+        expiresAt : Time
+      controller proposer
+      do
+        require "proposer is not a council member" (proposer `elem` members)
+        now <- getTime
+        require "proposal must expire in the future" (expiresAt > now)
+        require "market id must be 1-12 characters A-Z and 0-9" (validMarketId marketId)
+        require "invalid market parameters" (null (validateMarketParams market))
+        create MarketListingProposal with
+          operator; members; threshold; proposalId; proposer; marketId; market; factory; expiresAt
+          approvals = [proposer]
+
+    -- | Propose removing a collateral market (0.8.0). Executed by the operator after threshold approvals
+    -- (Delisting_Execute): account collateral and wallet balances of the asset are written off.
+    nonconsuming choice Council_ProposeDelisting : ContractId MarketDelistingProposal
+      with
+        proposer : Party
+        proposalId : Text
+        marketId : MarketId
+        expiresAt : Time
+      controller proposer
+      do
+        require "proposer is not a council member" (proposer `elem` members)
+        now <- getTime
+        require "proposal must expire in the future" (expiresAt > now)
+        create MarketDelistingProposal with
+          operator; members; threshold; proposalId; proposer; marketId; expiresAt
+          approvals = [proposer]
+
+template ParameterChangeProposal
+  with
+    operator : Party
+    members : [Party]
+    threshold : Int
+    proposalId : Text
+    description : Text
+    proposer : Party
+    baseParams : ProtocolParams
+    baseMarketParams : Map MarketId MarketParams
+    newParams : ProtocolParams
+    newMarketParams : Map MarketId MarketParams
+    newTransferFactories : Optional TransferFactories
+    expiresAt : Time
+    approvals : [Party]
+    baseTransferFactories : Optional TransferFactories
+      -- ^ config factories at proposal time (re-audit L8)
+    featuredAppRightChange : Optional FeaturedRightChange
+    newRoles : Optional Roles
+      -- ^ 0.4.0, audit D-5: new roles; only Proposal_ExecuteTrusted
+    baseRoles : Optional Roles
+      -- ^ 0.4.0: config roles at proposal time; a change from a stale base is rejected
+    proposedAt : Time
+      -- ^ risk 9: a lower liquidation factor takes effect `liquidationFactorDelay` after this
+  where
+    signatory operator, members
+
+    choice Proposal_Approve : ContractId ParameterChangeProposal
+      with
+        approver : Party
+      controller approver
+      do
+        require "approver is not a council member" (approver `elem` members)
+        require "already approved" (approver `notElem` approvals)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        create this with approvals = approver :: approvals
+
+    choice Proposal_Execute : ContractId ProtocolConfig
+      with
+        executor : Party
+        configCid : ContractId ProtocolConfig
+      controller executor
+      do
+        require "executor is not a council member" (executor `elem` members)
+        require "not enough approvals" (length approvals >= threshold)
+        config <- checkExecutable this configCid
+        require "trusted factory change needs the whole council and the operator: Proposal_ExecuteTrusted"
+          (optional True (== config.transferFactories) newTransferFactories)
+        require "setting a featured app right needs the operator: Proposal_ExecuteTrusted"
+          (not (setsFeaturedRight featuredAppRightChange))
+        require "role change needs the operator: Proposal_ExecuteTrusted"
+          (optional True (== config.roles) newRoles)
+        -- Audit D-10: reserve attestation protects borrowing against CBTC; it cannot be switched off by threshold
+        require "disabling reserve attestation needs the operator: Proposal_ExecuteTrusted"
+          (not (disablesAttestation config.marketParams newMarketParams))
+        applyProposal this configCid config
+
+    -- | Execute a proposal that changes factories, the Featured App right, roles, or switches off
+    -- reserve attestation (re-audit H1, 0.4.0 audit D-5). Needs threshold approvals
+    -- and the operator signature: the controller is the operator. Threshold, not all members: a lost key
+    -- of one member does not stop rotation of the registry factory.
+    choice Proposal_ExecuteTrusted : ContractId ProtocolConfig
+      with
+        configCid : ContractId ProtocolConfig
+        pauseCid : Optional (ContractId PauseState)
+          -- ^ 1.0.4 (review 03.10, item 14): with a new guardian, the pause flags are rebound in the
+          --   same transaction, so the old guardian never keeps them and pool operations never see
+          --   flags of another guardian
+      controller operator
+      do
+        require "not enough approvals" (length approvals >= threshold)
+        config <- checkExecutable this configCid
+        configCid' <- applyProposal this configCid config
+        config' <- fetch configCid'
+        case pauseCid of
+          Some cid | config'.roles.guardian /= config.roles.guardian -> do
+            _ <- exercise cid PauseState_Rebind with configCid = configCid'
+            pure ()
+          _ -> pure ()
+        pure configCid'
+
+    choice Proposal_Withdraw : ()
+      with
+        actor : Party
+      controller actor
+      do require "only the proposer can withdraw" (actor == proposer)
+
+-- | Expiry, council and staleness (audit S9, re-audit L8).
+checkExecutable : ParameterChangeProposal -> ContractId ProtocolConfig -> Update ProtocolConfig
+checkExecutable p configCid = do
+  now <- getTime
+  require "proposal expired" (now < p.expiresAt)
+  config <- fetch configCid
+  require "config is governed by another council" (config.governors == p.members)
+  require "parameters changed since the proposal: propose again"
+    (config.params == p.baseParams && config.marketParams == p.baseMarketParams)
+  -- A factory change from a stale base would roll back a newer rotation
+  require "transfer factories changed since the proposal: propose again"
+    (isNone p.newTransferFactories || p.baseTransferFactories == Some config.transferFactories)
+  require "roles changed since the proposal: propose again"
+    (isNone p.newRoles || p.baseRoles == Some config.roles)
+  -- Risk 9: absorb takes the whole collateral, so a lower liquidation factor would liquidate
+  -- accounts at once; it waits, as in Compound, so borrowers can add collateral or repay
+  require "lowering a liquidation factor takes effect 2 days after the proposal"
+    (not (lowersLiquidationFactor config.marketParams p.newMarketParams)
+      || now >= addRelTime p.proposedAt liquidationFactorDelay)
+  pure config
+
+-- | Risk 9: how long a lower liquidateCollateralFactor waits after the proposal.
+liquidationFactorDelay : RelTime
+liquidationFactorDelay = days 2
+
+-- | Some market's liquidateCollateralFactor or liquidationFactor goes down: absorbs come sooner or
+-- cost borrowers more, so the change waits `liquidationFactorDelay`.
+lowersLiquidationFactor : Map MarketId MarketParams -> Map MarketId MarketParams -> Bool
+lowersLiquidationFactor old new = any lower (Map.toList old)
+  where
+    -- 1.0.2: a lower liquidationFactor (a bigger absorb penalty) waits as well
+    lower (k, m) = optional False
+      (\n -> n.liquidateCollateralFactor < m.liquidateCollateralFactor
+        || n.liquidationFactor < m.liquidationFactor)
+      (Map.lookup k new)
+
+applyProposal : ParameterChangeProposal -> ContractId ProtocolConfig -> ProtocolConfig -> Update (ContractId ProtocolConfig)
+applyProposal p configCid config = do
+  let factories = if p.newTransferFactories == Some config.transferFactories then None else p.newTransferFactories
+      roles = if p.newRoles == Some config.roles then None else p.newRoles
+  configCid' <- exercise configCid Config_Update with
+    newParams = p.newParams; newMarketParams = p.newMarketParams
+    newTransferFactories = factories; newFeaturedAppRight = None
+    newRoles = roles
+  let target = case p.featuredAppRightChange of
+        None -> config.featuredAppRight
+        Some FeaturedRight_Clear -> None
+        Some (FeaturedRight_Set cid) -> Some cid
+  if target == config.featuredAppRight
+    then pure configCid'
+    else exercise configCid' Config_SetFeaturedAppRight with newFeaturedAppRight = target
+
+setsFeaturedRight : Optional FeaturedRightChange -> Bool
+setsFeaturedRight (Some (FeaturedRight_Set _)) = True
+setsFeaturedRight _ = False
+
+-- | A market whose reserve attestation existed and is being removed.
+disablesAttestation : Map MarketId MarketParams -> Map MarketId MarketParams -> Bool
+disablesAttestation old new = any off (Map.toList old)
+  where
+    off (k, m) = m.requiresReserveAttestation
+      && optional False (\n -> not n.requiresReserveAttestation) (Map.lookup k new)
+
+-- Council rotation (0.4.0, audit D-5) ---------------------------------------------------
+
+-- | Change of council membership and threshold. Signed by the operator, the old council and the
+-- new members who already joined: execution in the contract has the authority of everyone
+-- who signs the config, the pool and the new council.
+--
+-- An empty old council (members = []) means forming the first council: created by the operator,
+-- executable only for a config and pool without a council. This way the council is assembled from external
+-- parties, each signing with its own key (Rotation_Join).
+template CouncilRotation
+  with
+    operator : Party
+    members : [Party]
+      -- ^ current council
+    threshold : Int
+      -- ^ current council threshold; 0 during formation
+    rotationId : Text
+    proposer : Party
+    newMembers : [Party]
+    newThreshold : Int
+    expiresAt : Time
+    approvals : [Party]
+      -- ^ approvals of the current council
+    joined : [Party]
+      -- ^ new members not in the current council who have already signed
+  where
+    signatory operator, members, joined
+    observer newMembers
+    ensure newThreshold >= 1 && newThreshold <= length newMembers && unique newMembers
+      && operator `notElem` newMembers
+      && (if null members then threshold == 0 && proposer == operator else threshold >= 1)
+
+    choice Rotation_Approve : ContractId CouncilRotation
+      with
+        approver : Party
+      controller approver
+      do
+        require "approver is not a council member" (approver `elem` members)
+        require "already approved" (approver `notElem` approvals)
+        now <- getTime
+        require "rotation expired" (now < expiresAt)
+        create this with approvals = approver :: approvals
+
+    -- | A new member signs the rotation with their own key.
+    choice Rotation_Join : ContractId CouncilRotation
+      with
+        joiner : Party
+      controller joiner
+      do
+        require "joiner is not a new council member" (joiner `elem` newMembers && joiner `notElem` members)
+        require "already joined" (joiner `notElem` joined)
+        now <- getTime
+        require "rotation expired" (now < expiresAt)
+        create this with joined = joiner :: joined
+
+    -- | Replace the council, config and pool in one transaction. Executed by the operator or a member
+    -- of the current council; all needed authority comes from this contract's signatories.
+    choice Rotation_Execute : (ContractId GovernanceCouncil, ContractId ProtocolConfig, ContractId Pool)
+      with
+        executor : Party
+        councilCid : Optional (ContractId GovernanceCouncil)
+          -- ^ current council; None only during formation
+        configCid : ContractId ProtocolConfig
+        poolCid : ContractId Pool
+      controller executor
+      do
+        require "executor is not the operator or a council member" (executor == operator || executor `elem` members)
+        require "not enough approvals" (length approvals >= threshold)
+        require "every new council member must join" (F.all (\m -> m `elem` members || m `elem` joined) newMembers)
+        now <- getTime
+        require "rotation expired" (now < expiresAt)
+        config <- fetch configCid
+        require "config belongs to another operator" (config.roles.operator == operator)
+        require "config is governed by another council" (config.governors == members)
+        pool <- fetch poolCid
+        require "pool belongs to another operator" (pool.operator == operator)
+        require "pool is governed by another council" (pool.governors == members)
+        case councilCid of
+          None -> require "current council contract required" (null members)
+          Some cid -> do
+            council <- fetch cid
+            require "council does not match the rotation"
+              (council.operator == operator && council.members == members && council.threshold == threshold)
+            archive cid
+        configCid' <- exercise configCid Config_SetGovernors with newGovernors = newMembers
+        poolCid' <- exercise poolCid Pool_SetGovernors with newGovernors = newMembers
+        councilCid' <- create GovernanceCouncil with operator; members = newMembers; threshold = newThreshold
+        pure (councilCid', configCid', poolCid')
+
+    choice Rotation_Withdraw : ()
+      with
+        actor : Party
+      controller actor
+      do require "only the proposer can withdraw" (actor == proposer)
+
+-- New market (0.5.0) -------------------------------------------------------------------
+
+-- | Collateral market listing: market parameters and the instrument's trusted factory. The config and the pool
+-- get the market in one transaction, so their market sets always match (audit D-3).
+template MarketListingProposal
+  with
+    operator : Party
+    members : [Party]
+    threshold : Int
+    proposalId : Text
+    proposer : Party
+    marketId : MarketId
+    market : MarketParams
+    factory : ContractId TransferFactory
+    expiresAt : Time
+    approvals : [Party]
+  where
+    signatory operator, members
+
+    choice MarketListing_Approve : ContractId MarketListingProposal
+      with
+        approver : Party
+      controller approver
+      do
+        require "approver is not a council member" (approver `elem` members)
+        require "already approved" (approver `notElem` approvals)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        create this with approvals = approver :: approvals
+
+    -- | Execute: council threshold and operator signature (controller).
+    choice MarketListing_Execute : (ContractId ProtocolConfig, ContractId Pool)
+      with
+        configCid : ContractId ProtocolConfig
+        poolCid : ContractId Pool
+      controller operator
+      do
+        require "not enough approvals" (length approvals >= threshold)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        config <- fetch configCid
+        pool <- fetch poolCid
+        require "config is governed by another council" (config.governors == members)
+        require "pool is governed by another council" (pool.operator == operator && pool.governors == members)
+        configCid' <- exercise configCid Config_AddMarket with marketId; market; factory
+        poolCid' <- exercise poolCid Pool_AddMarket with marketId
+        pure (configCid', poolCid')
+
+    choice MarketListing_Withdraw : ()
+      with
+        actor : Party
+      controller actor
+      do require "only the proposer can withdraw" (actor == proposer)
+
+-- Market removal (0.8.0) ---------------------------------------------------------------
+
+-- | Removal of a collateral asset whose absorbed collateral is sold. In one transaction: the asset
+-- leaves the config and the pool, the listed accounts (without debt) drop their collateral of it, and, when no other market uses the
+-- instrument, the listed wallets drop its balance. The collateral is written off: delist a market that
+-- holds user collateral only after the users had time to withdraw it.
+-- An account or wallet left out keeps a stale entry; the operator passes all of them (ACS).
+template MarketDelistingProposal
+  with
+    operator : Party
+    members : [Party]
+    threshold : Int
+    proposalId : Text
+    proposer : Party
+    marketId : MarketId
+    expiresAt : Time
+    approvals : [Party]
+  where
+    signatory operator, members
+
+    choice Delisting_Approve : ContractId MarketDelistingProposal
+      with
+        approver : Party
+      controller approver
+      do
+        require "approver is not a council member" (approver `elem` members)
+        require "already approved" (approver `notElem` approvals)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        create this with approvals = approver :: approvals
+
+    -- | Execute: council threshold and operator signature (controller).
+    choice Delisting_Execute : (ContractId ProtocolConfig, ContractId Pool)
+      with
+        configCid : ContractId ProtocolConfig
+        poolCid : ContractId Pool
+        accountCids : [ContractId Account]
+        evmWalletCids : [ContractId EvmWallet]
+        loopWalletCids : [ContractId LoopWallet]
+          -- ^ 1.0.2: must be empty. A market is removed only once users withdrew its collateral
+          --   (Pool_RemoveMarket), and the instrument keeps its factory, so nothing is written off
+          --   and the council never sees an account or a wallet (rule 4, audit M2)
+      controller operator
+      do
+        require "not enough approvals" (length approvals >= threshold)
+        require "a delisting writes nothing off: users withdraw their collateral first"
+          (null accountCids && null evmWalletCids && null loopWalletCids)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        config <- fetch configCid
+        pool <- fetch poolCid
+        require "config is governed by another council" (config.roles.operator == operator && config.governors == members)
+        require "pool is governed by another council" (pool.operator == operator && pool.governors == members)
+        require ("unknown market " <> marketId) (Map.member marketId config.marketParams)
+        configCid' <- exercise configCid Config_RemoveMarket with marketId
+        poolCid' <- exercise poolCid Pool_RemoveMarket with marketId
+        pure (configCid', poolCid')
+
+    choice Delisting_Withdraw : ()
+      with
+        actor : Party
+      controller actor
+      do require "only the proposer can withdraw" (actor == proposer)
+
+-- Reserves (0.4.0, audit N4; K6) -----------------------------------------------------------
+
+-- | Withdrawal of reserves to treasury. Approved by the council threshold, executed by treasury: on
+-- top of the operator's and council's authority (proposal signatories) comes the receiver's signature,
+-- needed for the transfer. The pool allows it only from non-negative reserves (withdrawReserves).
+template IncomeProposal
+  with
+    operator : Party
+    members : [Party]
+    threshold : Int
+    proposalId : Text
+    proposer : Party
+    treasury : Party
+    reservesAmount : Decimal
+    expiresAt : Time
+    approvals : [Party]
+  where
+    signatory operator, members
+    observer treasury
+
+    choice IncomeProposal_Approve : ContractId IncomeProposal
+      with
+        approver : Party
+      controller approver
+      do
+        require "approver is not a council member" (approver `elem` members)
+        require "already approved" (approver `notElem` approvals)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        create this with approvals = approver :: approvals
+
+    choice IncomeProposal_Execute : ContractId Pool
+      with
+        poolCid : ContractId Pool
+        configCid : ContractId ProtocolConfig
+        reservesPayout : TransferArgs
+      controller treasury
+      do
+        require "not enough approvals" (length approvals >= threshold)
+        now <- getTime
+        require "proposal expired" (now < expiresAt)
+        pool <- fetch poolCid
+        require "pool is governed by another council" (pool.operator == operator && pool.governors == members)
+        exercise poolCid Pool_WithdrawReserves with
+          treasury; configCid; amount = reservesAmount; payout = reservesPayout
+
+    choice IncomeProposal_Withdraw : ()
+      with
+        actor : Party
+      controller actor
+      do require "only the proposer can withdraw" (actor == proposer)

@@ -1,0 +1,88 @@
+-- | Protocol deployment on Canton DevNet: tokens, config, pool, pause flags, prices, tester balances,
+-- starting reserves 15 000 USDCx (T4.2.1, K6). Run: python3 scripts/devnet.py deploy.
+--
+-- The protocol runs under a 2-of-3 council (re-audit): after the Featured App right is set,
+-- the config and pool are handed to the council via Council_Adopt. Pauses,
+-- oracle prices and user operations are unaffected; parameters and factories
+-- change from then on only by council proposal.
+module Test.Lending.Deploy where
+
+import DA.Foldable (forA_)
+import DA.List (sort)
+import DA.Text (isPrefixOf)
+import Daml.Script
+
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight)
+
+import Lending.Config
+import Lending.Governance
+import Lending.Pool
+import Lending.Types (noPause)
+import Test.Lending.Env
+import Test.Lending.MockRewards
+
+-- | DevNet (shared HackCanton node): parties are already created in the node console; the script gets
+-- them as a "name → party" list via --input-file. Test tokens are our own registries
+-- on splice-test-token-v1. There are as many testers as Tester<n> parties passed:
+-- the node limits accounts to 20 parties (scripts/devnet.py).
+deployDevnet : [(Text, Party)] -> Script Env
+deployDevnet parties = deployWith testers \name -> case lookup name parties of
+  Some p -> pure p
+  None -> abort ("party " <> name <> " is missing: create it in the node console")
+  where
+    testers = length [n | (n, _) <- parties, "Tester" `isPrefixOf` n]
+
+deployWith : Int -> (Text -> Script Party) -> Script Env
+deployWith count party = do
+  env0 <- setupWith party
+  -- test accounts: each has its own USDCx, CC and CBTC and an open account
+  testers <- forA [1 .. count] \i -> party ("Tester" <> show i)
+  let env = env0 with testers
+  forA_ testers \t -> do
+    mint env env.usdcx t 50000.0
+    mint env env.cc t 100000.0
+    mint env env.cbtc t 0.5
+    openAccount env t
+  mint env env.usdcx env.liquidator 50000.0
+  mint env env.usdcx env.backstop 25000.0
+  mint env env.usdcx env.treasury 15000.0
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  payment <- transferArgs env.treasury env.usdcx
+  -- starting reserves (K6): the former Insurance Fund
+  _ <- asUser env env.treasury $ exerciseCmd poolCid Pool_AddReserves with
+    actor = env.treasury; configCid; amount = 15000.0; payment
+  -- DevNet: a test Featured App right so that the §10 markers are visible on the ledger.
+  -- On DevNet the right is issued by DSO; the operator sets it via Config_SetFeaturedAppRight.
+  dso <- party "DemoDSO"
+  right <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = env.operator
+  (configCid', config) <- currentConfig env
+  _ <- submit env.operator $ exerciseCmd configCid' Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = Some (toInterfaceContractId @FeaturedAppRight right); newRoles = None
+  -- the 2-of-3 council adopts the config and pool
+  members <- forA [1 .. 3 : Int] \i -> party ("CouncilMember" <> show i)
+  councilCid <- submit (actAs (env.operator :: members)) $ createCmd GovernanceCouncil with
+    operator = env.operator; members; threshold = 2
+  (configCid'', _) <- currentConfig env
+  (poolCid', _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd councilCid Council_Adopt with configCid = configCid''; poolCid = poolCid'
+  -- council members go into deployment.json: devnet-setup signs market listings for them
+  pure env with council = members
+
+-- | Deployment under the council: guardian sets and lifts the pauses, the oracle updates prices,
+-- a user supplies, borrows and repays.
+test_deployGoverned : Script ()
+test_deployGoverned = do
+  env <- deployWith 3 allocateParty
+  (_, config) <- currentConfig env
+  (_, pool) <- currentPool env
+  assertMsg "config governed" (length config.governors == 3 && pool.governors == config.governors)
+  assertMsg "council in deploy output" (sort env.council == sort config.governors)
+  setPauseFlags env (\f -> f with borrowPaused = True; collateralWithdrawPaused = True)
+  setPauseFlags env (const noPause)
+  setPrice env env.cc 0.25
+  seedLiquidity env 1000.0
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  run env env.bob (borrowCmd env env.bob 250.0)
+  run env env.bob (supplyCmd env env.bob 300.0)

@@ -1,0 +1,51 @@
+-- | Deposits as holdings to the custodian (0.6.0, real assets: xReserve mint, CC with
+-- TransferPreapproval): registry of credited deposits and a record of each credit.
+-- Credited by EvmWallet_CreditDeposit (Lending.Evm).
+-- Separate module: templates in Lending.Evm would change the generated EvmWallet names
+-- (upgrade-check warnings).
+module Lending.EvmDeposit
+  ( DepositRegistry (..)
+  , DepositClaim (..)
+  , isTxHash
+  , validDepositRef
+  ) where
+
+import DA.Set (Set)
+import DA.Text qualified as T
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+-- | The custodian's credited deposits (0.6.0): depositRef of each credit. One per
+-- operator-custodian pair, both create it at setup (like EvmDirectory). Visible only to them.
+template DepositRegistry
+  with
+    operator : Party
+    custody : Party
+    refs : Set Text
+  where
+    signatory operator, custody
+    ensure operator /= custody
+
+-- | Record of a credited deposit (0.6.0): which wallet, how much and by which transaction.
+template DepositClaim
+  with
+    operator : Party
+    custody : Party
+    address : Text
+    instrumentId : InstrumentId
+    amount : Decimal
+    depositRef : Text
+    claimedAt : Time
+  where
+    signatory operator, custody
+    ensure amount > 0.0 && validDepositRef depositRef
+
+-- | Ethereum transaction hash: 0x and 64 lowercase hex.
+isTxHash : Text -> Bool
+isTxHash t = T.take 2 t == "0x" && T.length (T.drop 2 t) == 64 && all (`elem` T.explode "0123456789abcdef") (T.explode (T.drop 2 t))
+
+-- | Deposit id: non-empty, no surrounding whitespace, up to 256 chars. Starting with 0x: only
+-- a lowercase Ethereum hash; otherwise one hash would pass twice in different case.
+validDepositRef : Text -> Bool
+validDepositRef ref =
+  ref /= "" && T.trim ref == ref && T.length ref <= 256
+    && (T.take 2 ref /= "0x" || isTxHash ref)

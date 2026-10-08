@@ -1,0 +1,127 @@
+-- | T1.5.1 price template, T1.5.2 price check, T1.5.3 CBTC reserve and USDCx peg.
+module Test.Lending.OracleTest where
+
+import DA.Either (isLeft)
+import DA.Time (addRelTime, seconds)
+import Daml.Script
+
+import Lending.Oracle
+import Lending.Types (defaultProtocolParams, validateProtocolParams)
+import Test.Lending.Env
+
+test_priceFeedAuthority : Script ()
+test_priceFeedAuthority = do
+  env <- setup
+  now <- getTime
+  submitMustFail env.bob $ createCmd PriceFeed with
+    oracle = env.oracle; instrumentId = env.cc; observers = []
+    quotes = [PriceQuote "fake" 1.0 now]
+  submitMustFail env.oracle $ createCmd PriceFeed with
+    oracle = env.oracle; instrumentId = env.cc; observers = []
+    quotes = [PriceQuote "zero" 0.0 now]
+  cid <- feedFor env env.cc
+  submitMustFail env.bob $ exerciseCmd cid PriceFeed_Update with newQuotes = [PriceQuote "fake" 9.0 now]
+  setPrice env env.cc 0.25
+  feeds <- queryFilter @PriceFeed env.oracle (\f -> f.instrumentId == env.cc)
+  assertMsg "exactly one active feed" (length feeds == 1)
+
+test_priceValidity : Script ()
+test_priceValidity = do
+  env <- setup
+  seedLiquidity env 10000.0
+  -- 2.5% divergence: collateral price is the lower one, $0.200 → limit 50 000 × 0.2 × 0.3 = 3 000
+  setPrices env env.cc 0.2 0.205
+  run env env.carol (depositCmd env env.carol "CC" 50000.0)
+  mustFail env env.carol (borrowCmd env env.carol 3000.0001)
+  -- 3.5% divergence: borrow rejected
+  setPrices env env.cc 0.2 0.207
+  mustFail env env.carol (borrowCmd env env.carol 300.0)
+  -- age 300 seconds is valid, 301 is stale
+  setPrices env env.cc 0.2 0.2
+  refreshPrices env
+  passTime (seconds 300)
+  run env env.carol (borrowCmd env env.carol 300.0)
+  passTime (seconds 1)
+  mustFail env env.carol (borrowCmd env env.carol 300.0)
+
+test_reserveAndPeg : Script ()
+test_reserveAndPeg = do
+  env <- setup
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  att <- attestationFor env env.cbtc
+  now <- getTime
+  _ <- submit env.oracle $ exerciseCmd att ReserveAttestation_Update with
+    newCoverage = 0.999; newAttestedAt = now
+  -- coverage below 100%: CBTC adds nothing to the capacity, CC alone gives 1 200
+  mustFail env env.bob (borrowCmd env env.bob 1300.0)
+  run env env.bob (borrowCmd env env.bob 300.0)
+  att' <- attestationFor env env.cbtc
+  _ <- submit env.oracle $ exerciseCmd att' ReserveAttestation_Update with
+    newCoverage = 1.0; newAttestedAt = now
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  -- USDCx $0.975: borrow rejected, repayment passes; $0.98 is exactly 2%, borrow passes
+  setPrice env env.usdcx 0.975
+  mustFail env env.bob (borrowCmd env env.bob 300.0)
+  run env env.bob (supplyCmd env env.bob 100.0)
+  setPrice env env.usdcx 0.98
+  run env env.bob (borrowCmd env env.bob 300.0)
+
+-- Audit S4: a quote from the future and a repeat of one source are rejected
+test_futureAndDuplicateQuotes : Script ()
+test_futureAndDuplicateQuotes = do
+  env <- setup
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  cid <- feedFor env env.cc
+  now <- getTime
+  cid' <- submit env.oracle $ exerciseCmd cid PriceFeed_Update with
+    newQuotes = [PriceQuote "source-a" 0.2 now, PriceQuote "source-b" 0.2 (addRelTime now (seconds 61))]
+  mustFail env env.bob (borrowCmd env env.bob 300.0)
+  cid'' <- submit env.oracle $ exerciseCmd cid' PriceFeed_Update with
+    newQuotes = [PriceQuote "source-a" 0.2 now, PriceQuote "source-a" 0.2 now]
+  mustFail env env.bob (borrowCmd env env.bob 300.0)
+  _ <- submit env.oracle $ exerciseCmd cid'' PriceFeed_Update with
+    newQuotes = [PriceQuote "source-a" 0.2 now, PriceQuote "source-b" 0.2 (addRelTime now (seconds 60))]
+  run env env.bob (borrowCmd env env.bob 300.0)
+
+-- Audit: boundary of exactly 3%, the higher price for debt, upper peg boundary
+test_priceBoundaries : Script ()
+test_priceBoundaries = do
+  env <- setup
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  -- exactly 3% divergence passes
+  setPrices env env.cc 0.2 0.206
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  run env env.bob (borrowCmd env env.bob 300.0)
+  -- debt at the higher USDCx price: 1.00 and 1.02 → the debt is valued at 1.02
+  setPrices env env.usdcx 1.0 1.02
+  -- capacity $600 of CC + $5 000 of CBTC = $5 600 = 5 490.196 USDCx at 1.02, 300 already borrowed
+  updateParams env (\p -> p with maxDebtPerUser = 100000.0) []
+  mustFail env env.bob (borrowCmd env env.bob 5191.0)
+  run env env.bob (borrowCmd env env.bob 5190.0)
+  -- USDCx $1.025 is more than 2% above the peg: borrow rejected
+  setPrice env env.usdcx 1.025
+  run env env.bob (supplyCmd env env.bob 1000.0)
+  mustFail env env.bob (borrowCmd env env.bob 300.0)
+
+-- Audit K1: the divergence tolerance for liquidation is wider, freshness is the same
+test_liquidationPriceTolerance : Script ()
+test_liquidationPriceTolerance = do
+  env <- setup
+  now <- getTime
+  let p = defaultProtocolParams env.usdcx
+      feed a b = PriceFeed with
+        oracle = env.oracle; instrumentId = env.cc; observers = []
+        quotes = [PriceQuote "a" a now, PriceQuote "b" b now]
+  assertMsg "4% blocks borrowing" (isLeft (validPrice p now CollateralSide (feed 1.0 1.04)))
+  assertMsg "4% liquidates at the lower collateral price"
+    (validLiquidationPrice p now CollateralSide (feed 1.0 1.04) == Right 1.0)
+  assertMsg "15% passes, debt at the higher price"
+    (validLiquidationPrice p now DebtSide (feed 1.0 1.15) == Right 1.15)
+  assertMsg "above 15% rejected" (isLeft (validLiquidationPrice p now CollateralSide (feed 1.0 1.1501)))
+  assertMsg "stale rejected" (isLeft (validLiquidationPrice p (addRelTime now (seconds 301)) CollateralSide (feed 1.0 1.0)))
+  assertMsg "tolerance below the borrow threshold is invalid"
+    (not (null (validateProtocolParams (p with maxLiquidationSourceDeviation = 0.02))))

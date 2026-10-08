@@ -1,0 +1,17 @@
+# Host state for the external monitor (audit I-11): disk, memory, backup age.
+# Writes /opt/lending/status/host-health.json, nginx serves it at /healthz/host.
+[Unit]
+Description=Canton Lending: host health snapshot
+
+[Service]
+Type=oneshot
+User=lending
+Group=lending
+ExecStart=/opt/lending/bin/hostcheck.sh
+UMask=0022
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/lending/status
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=

@@ -1,0 +1,22 @@
+# /etc/sudoers.d/91-lending (audit I-2). Installed by setup.sh, checked with visudo -cf.
+# Only the exact command lines of the lending-ctl wrapper: no "*", no direct systemctl.
+# sudo compares arguments in full, so an extra argument or a path to a unit file will not pass.
+# The lending service user is not mentioned in sudoers and has no sudo.
+Cmnd_Alias LENDING_CTL = \
+  /usr/local/sbin/lending-ctl slot start blue, \
+  /usr/local/sbin/lending-ctl slot start green, \
+  /usr/local/sbin/lending-ctl slot stop blue, \
+  /usr/local/sbin/lending-ctl slot stop green, \
+  /usr/local/sbin/lending-ctl slot restart blue, \
+  /usr/local/sbin/lending-ctl slot restart green, \
+  /usr/local/sbin/lending-ctl slot enable blue, \
+  /usr/local/sbin/lending-ctl slot enable green, \
+  /usr/local/sbin/lending-ctl slot disable blue, \
+  /usr/local/sbin/lending-ctl slot disable green, \
+  /usr/local/sbin/lending-ctl switch blue, \
+  /usr/local/sbin/lending-ctl switch green, \
+  /usr/local/sbin/lending-ctl install-env, \
+  /usr/local/sbin/lending-ctl install-auth, \
+  /usr/local/sbin/lending-ctl install-monitor-token
+Defaults!LENDING_CTL !requiretty
+deploy ALL=(root) NOPASSWD: LENDING_CTL

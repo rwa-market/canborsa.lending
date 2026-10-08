@@ -1,0 +1,11 @@
+packages:
+  - backend
+  - frontend
+  - packages/*
+
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
+overrides:
+  # ws < 8.21 is vulnerable (GHSA-96hv-2xvq-fx4p): keep it at least that if a dependency pulls it in
+  'ws@>=8.0.0 <8.21.0': ^8.21.0

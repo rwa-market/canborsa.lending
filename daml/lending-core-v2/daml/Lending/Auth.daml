@@ -1,0 +1,56 @@
+-- | Backend API login via a ledger signature (audit V1). The user creates a Login
+-- with a one-time nonce from the backend; the operator sees the contract, issues a session and archives it.
+-- This way the backend knows the request's party really belongs to the caller.
+--
+-- Re-audit M5: Login has an expiry. An expired login is not redeemed for a session,
+-- and the operator removes abandoned Logins via Login_Expire.
+--
+-- 0.4.0, audit D-6: expiry no later than maxLoginTtl. A Login without expiry or with expiry beyond
+-- now + maxLoginTtl is not redeemed for a session; the operator removes it right away (Login_Reap):
+-- so nobody can bloat the operator's ACS with logins "until the year 2100".
+module Lending.Auth where
+
+import DA.Action (unless)
+import DA.Time (RelTime, addRelTime, minutes)
+
+-- | Maximum login lifetime. The backend sets no more than 10 minutes.
+maxLoginTtl : RelTime
+maxLoginTtl = minutes 15
+
+-- | The expiry fits within maxLoginTtl from `now`.
+withinLoginTtl : Time -> Optional Time -> Bool
+withinLoginTtl now = optional False (<= addRelTime now maxLoginTtl)
+
+template Login
+  with
+    user : Party
+    operator : Party
+    nonce : Text
+    expiresAt : Optional Time
+      -- ^ after this time the login is not accepted; None: a contract from before the re-audit
+  where
+    signatory user
+    observer operator
+
+    choice Login_Consume : Text
+      controller operator
+      do
+        now <- getTime
+        unless (optional True (now <) expiresAt) (abort "login expired")
+        unless (withinLoginTtl now expiresAt) (abort "login lifetime exceeds maxLoginTtl")
+        pure nonce
+
+    -- | Remove an abandoned login: expired or no expiry (old contract).
+    choice Login_Expire : ()
+      controller operator
+      do
+        now <- getTime
+        unless (optional True (now >=) expiresAt) (abort "login not expired yet")
+
+    -- | Remove a login without expiry or with expiry beyond now + maxLoginTtl (audit D-6).
+    -- An honest login with expiry within maxLoginTtl is not touched.
+    choice Login_Reap : ()
+      controller operator
+      do
+        now <- getTime
+        unless (not (withinLoginTtl now expiresAt)) (abort "login lifetime within maxLoginTtl: use Login_Expire")

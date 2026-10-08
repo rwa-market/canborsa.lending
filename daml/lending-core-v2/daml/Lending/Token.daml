@@ -1,0 +1,133 @@
+-- | Token Standard v1 transfers inside a protocol choice (ADR-001, D2).
+-- The calling choice must have the authority of both the sender and the receiver:
+-- the sender creates the transfer, the receiver accepts it right away.
+--
+-- Audit K1, K2: the factory is taken only from ProtocolConfig, and the received holdings
+-- are checked: owner, instrument, no lock, registry signature and amount.
+module Lending.Token
+  ( TransferArgs (..)
+  , transferNow
+  , transferOut
+  , verifyReceived
+  , ownHolding
+  ) where
+
+import DA.Action (unless)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Time (addRelTime, hours)
+import Splice.Api.Token.HoldingV1 (Holding, InstrumentId (..))
+import Splice.Api.Token.MetadataV1 (ExtraArgs, Metadata, emptyMetadata)
+import Splice.Api.Token.TransferInstructionV1
+
+-- | Everything the registry needs for one transfer. Prepared by the backend (T3.1.2).
+data TransferArgs = TransferArgs
+  with
+    factoryCid : ContractId TransferFactory
+      -- ^ must match the instrument's trusted factory
+    inputHoldingCids : [ContractId Holding]
+      -- ^ the sender's holdings
+    transferExtraArgs : ExtraArgs
+      -- ^ choice context for TransferFactory_Transfer
+    acceptExtraArgs : ExtraArgs
+      -- ^ choice context for TransferInstruction_Accept, if the registry returned Pending
+  deriving (Eq, Show)
+
+-- | Transfer `amount` from `sender` to `receiver` and complete the transfer in this transaction.
+transferNow
+  : Map InstrumentId (ContractId TransferFactory)
+  -> InstrumentId -> Party -> Party -> Decimal -> TransferArgs -> Update [ContractId Holding]
+transferNow trusted instrumentId sender receiver amount args = do
+  checkTrusted trusted instrumentId args
+  now <- getTime
+  let transfer = Transfer with
+        sender
+        receiver
+        amount
+        instrumentId
+        requestedAt = now
+        executeBefore = addRelTime now (hours 1)
+        inputHoldingCids = args.inputHoldingCids
+        meta = emptyMetadata
+  result <- exercise args.factoryCid TransferFactory_Transfer with
+    expectedAdmin = instrumentId.admin
+    transfer
+    extraArgs = args.transferExtraArgs
+  received <- case result.output of
+    TransferInstructionResult_Completed receiverHoldingCids -> pure receiverHoldingCids
+    TransferInstructionResult_Pending instructionCid -> do
+      accepted <- exercise instructionCid TransferInstruction_Accept with
+        extraArgs = args.acceptExtraArgs
+      case accepted.output of
+        TransferInstructionResult_Completed receiverHoldingCids -> pure receiverHoldingCids
+        _ -> abort "token transfer: receiver acceptance did not complete"
+    TransferInstructionResult_Failed -> abort "token transfer failed"
+  verifyReceived instrumentId receiver amount received
+  pure received
+
+-- | The receiver actually received `amount` of the instrument as free registry holdings.
+verifyReceived : InstrumentId -> Party -> Decimal -> [ContractId Holding] -> Update ()
+verifyReceived instrumentId receiver amount cids = do
+  amounts <- forA cids \cid -> do
+    h <- fetch cid
+    let v = view h
+    unless (v.owner == receiver) (abort "transfer: holding owned by another party")
+    unless (v.instrumentId == instrumentId) (abort "transfer: holding of another instrument")
+    unless (v.lock == None) (abort "transfer: received holding is locked")
+    unless (instrumentId.admin `elem` signatory h) (abort "transfer: holding not signed by the registry")
+    pure v.amount
+  unless (sum amounts == amount) (abort "transfer: received amount differs from the transfer")
+
+checkTrusted : Map InstrumentId (ContractId TransferFactory) -> InstrumentId -> TransferArgs -> Update ()
+checkTrusted trusted instrumentId args = case Map.lookup instrumentId trusted of
+  None -> abort "no trusted transfer factory for instrument"
+  Some factoryCid -> unless (factoryCid == args.factoryCid) (abort "untrusted transfer factory")
+
+-- | 0.6.0: transfer from `sender` to an external receiver whose authority is not in the transaction.
+-- The transfer cannot be accepted on its behalf, so the registry result is Completed (the receiver has
+-- a preapproval) or Pending (the instruction waits for the receiver until executeBefore).
+-- The sender cannot read the receiver's holdings; we check our own side: the inputs are
+-- the sender's free holdings of this instrument, and the change is less than the inputs by exactly `amount`.
+-- For Pending the instruction must be exactly this transfer.
+transferOut
+  : Map InstrumentId (ContractId TransferFactory)
+  -> InstrumentId -> Party -> Party -> Decimal -> Metadata -> TransferArgs -> Update TransferInstructionResult_Output
+transferOut trusted instrumentId sender receiver amount meta args = do
+  checkTrusted trusted instrumentId args
+  inputs <- forA args.inputHoldingCids (ownHolding instrumentId sender)
+  now <- getTime
+  let transfer = Transfer with
+        sender
+        receiver
+        amount
+        instrumentId
+        requestedAt = now
+        executeBefore = addRelTime now (hours 24)
+        inputHoldingCids = args.inputHoldingCids
+        meta
+  result <- exercise args.factoryCid TransferFactory_Transfer with
+    expectedAdmin = instrumentId.admin
+    transfer
+    extraArgs = args.transferExtraArgs
+  change <- forA result.senderChangeCids (ownHolding instrumentId sender)
+  unless (sum inputs - sum change == amount) (abort "transfer: sender spent a different amount than the transfer")
+  case result.output of
+    TransferInstructionResult_Completed _ -> pure ()
+    TransferInstructionResult_Pending instructionCid -> do
+      instruction <- fetch instructionCid
+      let t = (view instruction).transfer
+      unless (t.sender == sender && t.receiver == receiver && t.amount == amount && t.instrumentId == instrumentId)
+        (abort "transfer: pending instruction differs from the transfer")
+    TransferInstructionResult_Failed -> abort "token transfer failed"
+  pure result.output
+
+-- | A free holding of `owner` for this instrument, signed by the registry; its amount.
+ownHolding : InstrumentId -> Party -> ContractId Holding -> Update Decimal
+ownHolding instrumentId owner cid = do
+  h <- fetch cid
+  let v = view h
+  unless (v.owner == owner) (abort "transfer: holding owned by another party")
+  unless (v.instrumentId == instrumentId) (abort "transfer: holding of another instrument")
+  unless (v.lock == None) (abort "transfer: holding is locked")
+  unless (instrumentId.admin `elem` signatory h) (abort "transfer: holding not signed by the registry")
+  pure v.amount

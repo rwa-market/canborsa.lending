@@ -1,0 +1,51 @@
+-- | Collateralization of a whole account (K3): one debt against all of its collateral.
+module Lending.Risk where
+
+import DA.Map (Map)
+import DA.Map qualified as Map
+
+import Lending.Math
+import Lending.Types
+
+-- | One collateral asset of an account with what the pool knows about it.
+data CollateralLine = CollateralLine
+  with
+    marketId : MarketId
+    amount : N
+    params : MarketParams
+    price : Optional N
+      -- ^ valid price for this check; None: no valid price
+    attested : Bool
+      -- ^ reserve attestation fresh and sufficient, or not required
+  deriving (Eq, Show)
+
+-- | Borrow capacity in USD: Σ collateral × price × borrowCollateralFactor (isBorrowCollateralized).
+-- Risk 4: an asset without a valid price counts as zero; an asset without a fresh reserve
+-- attestation adds nothing either.
+borrowCapacity : [CollateralLine] -> N
+borrowCapacity ls = sum
+  [ mulDown (mulDown l.amount p) l.params.borrowCollateralFactor
+  | l <- ls, l.attested, Some p <- [l.price] ]
+
+-- | Liquidation point in USD: Σ collateral × price × liquidateCollateralFactor (isLiquidatable).
+-- Every asset must have a price: Left names the first one without.
+liquidationPoint : [CollateralLine] -> Either Text N
+liquidationPoint ls = do
+  parts <- forA ls \l -> case l.price of
+    None -> Left ("no valid price for collateral " <> l.marketId)
+    Some p -> Right (mulDown (mulDown l.amount p) l.params.liquidateCollateralFactor)
+  pure (sum parts)
+
+-- | Collateral value in USD at the given prices; an asset without a price counts as zero.
+collateralValue : [CollateralLine] -> N
+collateralValue ls = sum [ mulDown l.amount p | l <- ls, Some p <- [l.price] ]
+
+-- | Account collateral with a positive amount.
+heldCollateral : Map MarketId N -> [(MarketId, N)]
+heldCollateral c = filter (\(_, a) -> a > 0.0) (Map.toList c)
+
+-- | Purchase price of absorbed collateral in USD (quoteCollateral):
+-- price × (1 − storeFrontPriceFactor × (1 − liquidationFactor)).
+discountedPrice : ProtocolParams -> MarketParams -> N -> N
+discountedPrice p m price =
+  mulN price (1.0 - mulN p.storeFrontPriceFactor (1.0 - m.liquidationFactor))

@@ -1,0 +1,94 @@
+-- | BitSafe challenge demo (T4.1.2): a 2-of-3 council changes the CBTC Collateral Factor from 50% to 45%.
+-- Run: dpm test (IDE ledger) or dpm script on LocalNet. Each step writes a log line.
+-- demoDecMan: the same change through a BitSafe Decentralized Party.
+module Test.Lending.BitSafeDemo where
+
+import DA.Map qualified as Map
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Governance.Action (GovernableAction)
+
+import Lending.Config
+import Lending.Governance
+import Lending.Types
+import Test.Lending.DecManTest
+import Test.Lending.Env
+
+verdict : Either a b -> Text
+verdict = either (const "REJECTED") (const "accepted")
+
+demo : Script ()
+demo = do
+  env <- setupNamed "bitsafe-"
+  m1 <- allocateParty "bitsafe-Member1"
+  m2 <- allocateParty "bitsafe-Member2"
+  m3 <- allocateParty "bitsafe-Member3"
+  let members = [m1, m2, m3]
+  councilCid <- submit (actAs (env.operator :: members)) $ createCmd GovernanceCouncil with
+    operator = env.operator; members; threshold = 2
+  debug "1. Council created: 3 members, threshold 2"
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd councilCid Council_Adopt with configCid; poolCid
+  debug "2. Config and pool adopted: parameters need the council's signature"
+  seedLiquidity env 10000.0
+  (configCid1, config) <- currentConfig env
+  r <- trySubmit env.operator $ exerciseCmd configCid1 Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None; newFeaturedAppRight = None; newRoles = None
+  debug ("3. Operator alone changes params: " <> verdict r)
+  now <- getTime
+  p1 <- submit m1 $ exerciseCmd councilCid Council_Propose with
+    proposer = m1; proposalId = "bitsafe-1"; description = "Lower the CBTC Collateral Factor from 50% to 45%"
+    configCid = configCid1
+    newParams = config.params
+    newMarketParams = Map.alter (fmap (\m -> m with borrowCollateralFactor = 0.45)) "CBTC" config.marketParams
+    newTransferFactories = None
+    expiresAt = addRelTime now (days 3)
+    featuredAppRightChange = None; newRoles = None
+  debug "4. Member1 proposes the CBTC Collateral Factor 50% -> 45% (1 of 2 approvals)"
+  early <- trySubmit m1 $ exerciseCmd p1 Proposal_Execute with executor = m1; configCid = configCid1
+  debug ("5. Execute with 1 approval: " <> verdict early)
+  p1' <- submit m2 $ exerciseCmd p1 Proposal_Approve with approver = m2
+  debug "6. Member2 approves (2 of 2)"
+  _ <- submit m3 $ exerciseCmd p1' Proposal_Execute with executor = m3; configCid = configCid1
+  mp <- marketParamsFor env "CBTC"
+  debug ("7. Executed. CBTC Collateral Factor is now " <> show mp.borrowCollateralFactor)
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  cmd <- borrowCmd env env.bob 5000.0
+  ds <- disclosures env
+  borrow50 <- trySubmit (actAs env.bob <> discloseMany ds) cmd
+  debug ("8. Borrow 5 000 USDCx on $10 000 CBTC (50%): " <> verdict borrow50)
+  cmd45 <- borrowCmd env env.bob 4500.0
+  ds45 <- disclosures env
+  borrow45 <- trySubmit (actAs env.bob <> discloseMany ds45) cmd45
+  debug ("9. Borrow 4 500 USDCx (45%): " <> verdict borrow45)
+  case borrow45 of
+    Left e -> debug (show e) >> abort "the 45% borrow must pass"
+    Right _ -> pure ()
+
+-- | The same change through a BitSafe Decentralized Party (lending-decman): the council's only member
+-- is the party, its GovernanceRules (governance-core-v1) hold the 2-of-3 threshold of the member nodes.
+demoDecMan : Script ()
+demoDecMan = do
+  env <- setupNamed "decman-"
+  d <- setupDm env
+  debug "1. Decentralized party with 2-of-3 GovernanceRules joined the council by a vote; the operator formed it"
+  seedLiquidity env 10000.0
+  a <- paramsAction env d d.m1 "bitsafe-1" (withLtv 0.45)
+  let actionCid = toInterfaceContractId @GovernableAction a
+  debug "2. Member1 proposes the CBTC Collateral Factor 50% -> 45% (LendingParamsAction)"
+  c1 <- confirm d d.m1 actionCid
+  early <- trySubmit (as d d.m1) $ executeCmd d d.m1 actionCid [c1]
+  debug ("3. Execute with 1 confirmation: " <> verdict early)
+  c2 <- confirm d d.m2 actionCid
+  _ <- submit (as d d.m2) $ executeCmd d d.m2 actionCid [c1, c2]
+  mp <- marketParamsFor env "CBTC"
+  debug ("4. Member2 confirms and executes. CBTC Collateral Factor is now " <> show mp.borrowCollateralFactor)
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  cmd <- borrowCmd env env.bob 5000.0
+  ds <- disclosures env
+  borrow50 <- trySubmit (actAs env.bob <> discloseMany ds) cmd
+  debug ("5. Borrow 5 000 USDCx on $10 000 CBTC (50%): " <> verdict borrow50)
+  run env env.bob (borrowCmd env env.bob 4500.0)
+  debug "6. Borrow 4 500 USDCx (45%): accepted"

@@ -1,0 +1,56 @@
+# AI tooling settings: local, not versioned
+.claude/
+.codex/
+.agents/
+CLAUDE.md
+AGENTS.md
+.mcp.json
+skills-lock.json
+.env.notion
+.env.notion.example
+docs/
+
+# Dependencies and build
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Daml
+.daml/
+*.dar
+!daml/**/vendor/*.dar
+
+# Data and secrets
+*.db
+*.db-journal
+*.sqlite
+.env
+.env.*
+!.env.example
+!.env.devnet.example
+!.env.testnet.example
+# public VITE_* for local development against DevNet
+!frontend/.env.development
+
+# System
+.DS_Store
+*.log
+*.db-wal
+*.db-shm
+backend/data/
+frontend/test-results/
+frontend/playwright-report/
+
+# DevNet tokens (scripts/devnet-login.sh)
+.local/
+
+# operator's TestNet profile (scripts/deploy-testnet.sh): addresses, token paths, output
+deploy/testnet.env
+deploy/testnet.deploy-input.json
+deploy/testnet.deployment.json
+deploy/testnet.credentials.env
+
+# Python logs and cache
+daml/log/
+__pycache__/

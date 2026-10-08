@@ -1,0 +1,165 @@
+-- | Removing a collateral asset (MarketDelistingProposal, 1.0.2): only once users withdrew its
+-- collateral; nothing is written off and the council sees no account. CBTC keeps working.
+module Test.Lending.DelistingTest where
+
+import DA.Foldable (forA_)
+import DA.Map qualified as Map
+import DA.Time (addRelTime, days, hours)
+import Daml.Script
+
+import Lending.Account
+import Lending.Config
+import Lending.Evm (EvmWallet, EvmWallet_DropInstrument (..))
+import Lending.Governance
+import Lending.Pool
+import Test.Lending.Env
+import Test.Lending.EvmTest (receive, setupEvm, walletOf)
+import Test.Lending.GovernanceTest (Council (..), setupCouncil)
+
+proposeDelisting : Env -> Council -> Party -> Text -> Script (ContractId MarketDelistingProposal)
+proposeDelisting env c proposer marketId = do
+  now <- getTime
+  submit proposer $ exerciseCmd c.cid Council_ProposeDelisting with
+    proposer; proposalId = "delist-" <> marketId; marketId; expiresAt = addRelTime now (days 1)
+
+-- | Every account with collateral of the asset and every EVM wallet with a balance of the instrument.
+holdersOf : Env -> Party -> Text -> Script ([ContractId Account], [ContractId EvmWallet])
+holdersOf env custody marketId = do
+  accounts <- queryFilter @Account env.operator (\a -> Map.member marketId a.collateral)
+  wallets <- queryFilter @EvmWallet custody (\w -> Map.member (marketInstrument env marketId) w.balances)
+  pure (map fst accounts, map fst wallets)
+
+delistCmd : Env -> ContractId MarketDelistingProposal -> [ContractId Account] -> [ContractId EvmWallet] -> Script (Commands (ContractId ProtocolConfig, ContractId Pool))
+delistCmd env p accounts wallets = do
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  pure $ exerciseCmd p Delisting_Execute with
+    configCid; poolCid; accountCids = accounts; evmWalletCids = wallets; loopWalletCids = []
+
+test_delistMarket : Script ()
+test_delistMarket = do
+  e <- setupEvm
+  let env = e.env
+  c <- setupCouncil env
+  -- Carol: CC collateral, no debt; the EVM wallet: a CC balance; Bob: CBTC loan
+  run env env.carol (depositCmd env env.carol "CC" 1000.0)
+  receive e env.cc 50.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  p <- proposeDelisting env c c.m1 "CC"
+  (accounts, wallets) <- holdersOf env e.custody "CC"
+  assertMsg "one account and one wallet hold CC" (length accounts == 1 && length wallets == 1)
+  -- one approval of a 2-of-3 council is not enough
+  cmd <- delistCmd env p [] []
+  submitMustFail env.operator cmd
+  submitMustFail c.outsider $ exerciseCmd p Delisting_Approve with approver = c.outsider
+  p' <- submit c.m2 $ exerciseCmd p Delisting_Approve with approver = c.m2
+  -- 1.0.2: a delisting writes nothing off, and it waits while users hold collateral of the market
+  writeOff <- delistCmd env p' accounts wallets
+  submitMustFail env.operator writeOff
+  early <- delistCmd env p' [] []
+  submitMustFail env.operator early
+  run env env.carol (withdrawCollateralCmd env env.carol "CC" 1000.0)
+  -- a council member cannot execute without the operator
+  cmd' <- delistCmd env p' [] []
+  submitMustFail c.m2 cmd'
+  _ <- submit env.operator cmd'
+  (_, config) <- currentConfig env
+  (_, pool) <- currentPool env
+  assertMsg "CC left the config" (not (Map.member "CC" config.marketParams))
+  assertMsg "CC factory stays: wallets can still move the instrument" (Map.member env.cc config.transferFactories)
+  assertMsg "CC left the pool" (not (Map.member "CC" pool.markets))
+  (_, wallet) <- walletOf e
+  assertMsg "the wallet's CC balance is untouched" (Map.lookup env.cc wallet.balances == Some 50.0)
+  -- rule 4: the council never saw an account or a wallet
+  forA_ [c.m1, c.m2, c.m3] \m -> do
+    seen <- query @Account m
+    assertMsg "council member sees no account" (null seen)
+  -- the rest of the protocol works
+  run env env.bob (borrowCmd env env.bob 500.0)
+  run env env.bob (supplyCmd env env.bob 500.0)
+  run env env.alice (supplyCmd env env.alice 100.0)
+  -- deposits to the removed market fail
+  mustFail env env.carol (depositCmd env env.carol "CC" 1.0)
+
+-- The collateral of an account with debt is not written off: the removal fails as a whole
+test_delistWithDebtRejected : Script ()
+test_delistWithDebtRejected = do
+  env <- setup
+  c <- setupCouncil env
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  p <- proposeDelisting env c c.m1 "CBTC"
+  p' <- submit c.m2 $ exerciseCmd p Delisting_Approve with approver = c.m2
+  (accounts, _) <- holdersOf env env.carol "CBTC"
+  cmd <- delistCmd env p' accounts []
+  submitMustFail env.operator cmd
+  -- not even with all the authority
+  (configCid, config) <- currentConfig env
+  (bobCid, _) <- accountOf env env.bob
+  submitMustFail (actAs (env.operator :: config.governors)) $ exerciseCmd bobCid Account_DropMarket with
+    governors = config.governors; configCid; marketId = "CBTC"
+
+-- The drop choices need the council: the operator alone cannot write off collateral or balances
+test_dropNeedsCouncil : Script ()
+test_dropNeedsCouncil = do
+  e <- setupEvm
+  let env = e.env
+  run env env.carol (depositCmd env env.carol "CC" 1000.0)
+  receive e env.cc 50.0
+  (configCid, _) <- currentConfig env
+  (carolCid, _) <- accountOf env env.carol
+  (walletCid, _) <- walletOf e
+  -- no council: governors empty
+  submitMustFail env.operator $ exerciseCmd carolCid Account_DropMarket with
+    governors = []; configCid; marketId = "CC"
+  submitMustFail (actAs [env.operator, e.custody]) $ exerciseCmd walletCid EvmWallet_DropInstrument with
+    governors = []; configCid; instrument = env.cc
+  _ <- setupCouncil env
+  (configCid', config) <- currentConfig env
+  -- the operator without the council's authority
+  submitMustFail env.operator $ exerciseCmd carolCid Account_DropMarket with
+    governors = config.governors; configCid = configCid'; marketId = "CC"
+  -- with all the authority, a listed market is not dropped
+  submitMustFail (actAs (env.operator :: config.governors)) $ exerciseCmd carolCid Account_DropMarket with
+    governors = config.governors; configCid = configCid'; marketId = "CC"
+  submitMustFail (actAs (env.operator :: e.custody :: config.governors)) $ exerciseCmd walletCid EvmWallet_DropInstrument with
+    governors = config.governors; configCid = configCid'; instrument = env.cc
+  -- Pool and config removal also need the council
+  (poolCid, _) <- currentPool env
+  submitMustFail env.operator $ exerciseCmd poolCid Pool_RemoveMarket with marketId = "CC"
+  submitMustFail env.operator $ exerciseCmd configCid' Config_RemoveMarket with marketId = "CC"
+
+-- Expired proposals and outsiders are rejected; only the author withdraws
+test_delistingProposalRules : Script ()
+test_delistingProposalRules = do
+  env <- setup
+  c <- setupCouncil env
+  now <- getTime
+  submitMustFail c.outsider $ exerciseCmd c.cid Council_ProposeDelisting with
+    proposer = c.outsider; proposalId = "x"; marketId = "CC"; expiresAt = addRelTime now (days 1)
+  p <- proposeDelisting env c c.m1 "CC"
+  p' <- submit c.m2 $ exerciseCmd p Delisting_Approve with approver = c.m2
+  passTime (days 1 + hours 1)
+  cmd <- delistCmd env p' [] []
+  submitMustFail env.operator cmd
+  submitMustFail c.m2 $ exerciseCmd p' Delisting_Withdraw with actor = c.m2
+  submit c.m1 $ exerciseCmd p' Delisting_Withdraw with actor = c.m1
+
+-- Absorbed collateral must be sold before the asset is removed
+test_delistWithUnsoldCollateralRejected : Script ()
+test_delistWithUnsoldCollateralRejected = do
+  env <- setup
+  c <- setupCouncil env
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  setPrice env env.cc 0.1
+  absorb env env.bob
+  m <- marketOf env "CC"
+  assertMsg "absorbed collateral held" (m.protocolCollateral == 20000.0)
+  p <- proposeDelisting env c c.m1 "CC"
+  p' <- submit c.m2 $ exerciseCmd p Delisting_Approve with approver = c.m2
+  cmd <- delistCmd env p' [] []
+  submitMustFail env.operator cmd

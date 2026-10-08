@@ -1,0 +1,260 @@
+-- | BitSafe Decentralization Manager demo on a LocalNet with a real Decentralized Party.
+--
+-- Unlike DecManTest/BitSafeDemo, the script does not create the decentralized party or its
+-- GovernanceRules: DecMan does (onboarding + contracts workflows), and the script TAKES them
+-- through --input-file. Members p2 and p3 live on their own participants: the script runs with
+-- --participant-config and each member submits on its node with readAs of the decentralized party.
+--
+--   dpm script --dar lending-tests-<v>.dar --script-name Test.Lending.DecManLocalNet:runOnExisting \
+--     --participant-config participants.json --input-file input.json --output-file result.json
+--
+-- On the IDE ledger the same flow runs as test_localNetOnIde: a setup step first creates the party
+-- and its rules the way DecMan leaves them.
+module Test.Lending.DecManLocalNet where
+
+import DA.Map qualified as Map
+import DA.Optional (fromOptional, isSome)
+import DA.Set qualified as Set
+import DA.Text qualified as T
+import DA.Time (addRelTime, days, hours)
+import Daml.Script
+
+import Governance.Action (GovernableAction)
+import Governance.Confirmation (GovernanceConfirmation)
+import Governance.Rules
+
+import Lending.Config
+import Lending.DecMan
+import Lending.Governance
+import Lending.Math (N)
+import Test.Lending.Env
+
+-- | What DecMan produced: the decentralized party, its GovernanceRules and the member parties
+-- (one per hosting participant). prefix: party-name prefix of this run (must be new per run on
+-- a persistent ledger). ledgerUser: on a real participant, the user that gets act-as rights
+-- on the parties the script allocates (LocalNet: "ledger-api-user"); None on the IDE ledger.
+data LocalNetInput = LocalNetInput with
+    decParty : Party
+    rulesCid : ContractId GovernanceRules
+    members : [Party]
+    prefix : Text
+    ledgerUser : Optional Text
+  deriving (Eq, Show)
+
+data LocalNetResult = LocalNetResult with
+    decParty : Party
+    operator : Party
+    councilCid : ContractId GovernanceCouncil
+    governors : [Party]
+    factorBefore : N
+    factorAfter : N
+    operatorAloneUpdate : Text
+    executeWithOneConfirmation : Text
+    borrowAboveLimit : Text
+    borrowWithinLimit : Text
+  deriving (Eq, Show)
+
+verdict : Either a b -> Text
+verdict = either (const "REJECTED") (const "accepted")
+
+-- | Verdict with the start of the ledger's reason, for the log.
+because : Show a => Either a b -> Text
+because (Left e) = "REJECTED: " <> T.take 220 (show e)
+because (Right _) = "accepted"
+
+-- | Allocate a party; on a participant also give the script's user the right to act as it.
+allocateFor : LocalNetInput -> Text -> Script Party
+allocateFor input name = do
+  p <- allocateParty (input.prefix <> name)
+  case input.ledgerUser of
+    None -> pure ()
+    Some u -> do
+      uid <- validateUserId u
+      _ <- grantUserRights uid [CanActAs p]
+      pure ()
+  pure p
+
+-- | Member m submits on its own participant, seeing the rules through the decentralized party.
+asMember : LocalNetInput -> Party -> SubmitOptions
+asMember input m = actAs m <> readAs input.decParty
+
+confirmBy : LocalNetInput -> Party -> ContractId GovernableAction -> Script (ContractId GovernanceConfirmation)
+confirmBy input m actionCid = do
+  r <- submit (asMember input m) $ exerciseCmd input.rulesCid GovernanceRules_ConfirmAction with
+    confirmer = m; actionProposalCid = actionCid
+  pure r.confirmationCid
+
+executeBy : LocalNetInput -> Party -> ContractId GovernableAction -> [ContractId GovernanceConfirmation] -> Script (Either SubmitError ())
+executeBy input m actionCid confirmations = do
+  r <- trySubmit (asMember input m) $ exerciseCmd input.rulesCid GovernanceRules_ExecuteConfirmedAction with
+    executor = m; actionProposalCid = actionCid; confirmations
+  pure (fmap (const ()) r)
+
+-- | The rules must belong to the given party and list the given members, with a threshold of
+-- at least 2: the script refuses to "decentralize" through a one-member or foreign rule set.
+rulesProblem : LocalNetInput -> Optional GovernanceRules -> Optional Text
+rulesProblem input rules = case rules of
+  None -> Some "GovernanceRules not visible to the decentralized party"
+  Some r
+    | r.governanceParty /= input.decParty -> Some "rules of another party"
+    | r.members /= Set.fromList input.members -> Some "members differ from the input"
+    | r.threshold < 2 || r.threshold > length input.members -> Some "threshold must be from 2 to the member count"
+    | otherwise -> None
+
+checkRules : LocalNetInput -> Script GovernanceRules
+checkRules input = do
+  rules <- queryContractId input.decParty input.rulesCid
+  case (rulesProblem input rules, rules) of
+    (None, Some r) -> pure r
+    (problem, _) -> abort (fromOptional "no rules" problem)
+
+-- | Deploy the protocol, hand it to a council of one Decentralized Party, change the CBTC
+-- borrow collateral factor 50% -> 45% by a 2-of-3 vote of the member nodes, check borrows.
+runOnExisting : LocalNetInput -> Script LocalNetResult
+runOnExisting input = do
+  m1 <- case input.members of
+    m :: _ -> pure m
+    [] -> abort "no members"
+  m2 <- case input.members of
+    _ :: m :: _ -> pure m
+    _ -> abort "need at least two members"
+  rules <- checkRules input
+  debug ("1. Decentralized party " <> show input.decParty <> ": GovernanceRules "
+    <> show rules.threshold <> " of " <> show (Set.size rules.members) <> " members")
+  env <- setupWith (allocateFor input)
+  debug "2. Protocol deployed: config, pool, CC and CBTC markets, prices, test tokens"
+  -- the decentralized party joins as the only council member, by a vote of its members
+  now <- getTime
+  rotationCid <- submit env.operator $ createCmd CouncilRotation with
+    operator = env.operator; members = []; threshold = 0; rotationId = input.prefix <> "decman"
+    proposer = env.operator; newMembers = [input.decParty]; newThreshold = 1
+    expiresAt = addRelTime now (days 1); approvals = []; joined = []
+  joinCid <- submit m1 $ createCmd LendingRotationAction with
+    governanceParty = input.decParty; proposer = m1; operator = env.operator; step = RotationJoin
+    rotationCid = Some rotationCid; councilCid = None; newMembers = [input.decParty]; newThreshold = 1; note = ""
+  let joinAction = toInterfaceContractId @GovernableAction joinCid
+  j1 <- confirmBy input m1 joinAction
+  j2 <- confirmBy input m2 joinAction
+  executeBy input m1 joinAction [j1, j2] >>= either (\e -> abort ("join vote: " <> show e)) pure
+  [(joined, _)] <- query @CouncilRotation env.operator
+  (configCid0, _) <- currentConfig env
+  (poolCid0, _) <- currentPool env
+  (councilCid, _, _) <- submit env.operator $ exerciseCmd joined Rotation_Execute with
+    executor = env.operator; councilCid = None; configCid = configCid0; poolCid = poolCid0
+  (configCid1, config0) <- currentConfig env
+  debug ("3. Council formed by a 2-of-3 vote: governors = " <> show config0.governors)
+  r <- trySubmit env.operator $ exerciseCmd configCid1 Config_Update with
+    newParams = config0.params; newMarketParams = config0.marketParams; newTransferFactories = None
+    newFeaturedAppRight = None; newRoles = None
+  debug ("4. Operator alone changes params: " <> because r)
+  seedLiquidity env 10000.0
+  before <- marketParamsFor env "CBTC"
+  -- the proposal
+  (configCid, config) <- currentConfig env
+  let c = withCbtcFactor 0.45 config
+  a <- submit m1 $ createCmd LendingParamsAction with
+    governanceParty = input.decParty; proposer = m1; operator = env.operator; councilCid; configCid
+    proposalId = input.prefix <> "cbtc-45"; newParams = c.params; newMarketParams = c.marketParams
+    newTransferFactories = None; featuredAppRightChange = None; newRoles = None
+    proposalTtl = days 3; note = "Lower the CBTC borrow collateral factor from 50% to 45%"
+    base = Some ParamsBase with params = config.params; marketParams = config.marketParams
+  let actionCid = toInterfaceContractId @GovernableAction a
+  debug ("5. Member p1 proposes CBTC borrowCollateralFactor " <> show before.borrowCollateralFactor
+    <> " -> 0.45 (LendingParamsAction)")
+  c1 <- confirmBy input m1 actionCid
+  early <- executeBy input m1 actionCid [c1]
+  debug ("6. Member p1 confirms; execute with 1 of 2 confirmations: " <> because early)
+  c2 <- confirmBy input m2 actionCid
+  executeBy input m2 actionCid [c1, c2] >>= either (\e -> abort ("params vote: " <> show e)) pure
+  after <- marketParamsFor env "CBTC"
+  debug ("7. Member p2 confirms on its own node and executes: CBTC borrowCollateralFactor = "
+    <> show after.borrowCollateralFactor)
+  -- borrows against 0.1 CBTC = $10 000
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  above <- tryBorrow env 5000.0
+  debug ("8. Borrow 5 000 USDCx on $10 000 CBTC (50%, above the new limit): " <> because above)
+  within <- tryBorrow env 4500.0
+  debug ("9. Borrow 4 500 USDCx (45%, within the new limit): " <> verdict within)
+  (_, configAfter) <- currentConfig env
+  pure LocalNetResult with
+    decParty = input.decParty; operator = env.operator; councilCid; governors = configAfter.governors
+    factorBefore = before.borrowCollateralFactor; factorAfter = after.borrowCollateralFactor
+    operatorAloneUpdate = verdict r
+    executeWithOneConfirmation = verdict early
+    borrowAboveLimit = verdict above; borrowWithinLimit = verdict within
+
+tryBorrow : Env -> Decimal -> Script (Either SubmitError ())
+tryBorrow env amount = do
+  cmd <- borrowCmd env env.bob amount
+  ds <- disclosures env
+  r <- trySubmit (actAs env.bob <> discloseMany ds) cmd
+  pure (fmap (const ()) r)
+
+withCbtcFactor : N -> ProtocolConfig -> ProtocolConfig
+withCbtcFactor ltv c = c with
+  marketParams = Map.alter (fmap (\m -> m with borrowCollateralFactor = ltv)) "CBTC" c.marketParams
+
+-- | A proposal only, for the DecMan UI/API path: the member nodes then confirm and execute it
+-- with POST /governance/confirm and /governance/execute (governance_type core_domain).
+data ProposeInput = ProposeInput with
+    decParty : Party
+    proposer : Party
+    operator : Party
+    market : Text
+    factor : N
+    proposalId : Text
+  deriving (Eq, Show)
+
+proposeOnExisting : ProposeInput -> Script (ContractId LendingParamsAction)
+proposeOnExisting input = do
+  [(configCid, config)] <- query @ProtocolConfig input.operator
+  [(councilCid, _)] <- query @GovernanceCouncil input.operator
+  let marketParams = Map.alter (fmap (\m -> m with borrowCollateralFactor = input.factor)) input.market config.marketParams
+  assertMsg ("no market " <> input.market) (Map.member input.market config.marketParams)
+  a <- submit input.proposer $ createCmd LendingParamsAction with
+    governanceParty = input.decParty; proposer = input.proposer; operator = input.operator; councilCid; configCid
+    proposalId = input.proposalId; newParams = config.params; newMarketParams = marketParams
+    newTransferFactories = None; featuredAppRightChange = None; newRoles = None
+    proposalTtl = days 3; note = input.market <> " borrowCollateralFactor -> " <> show input.factor
+    base = Some ParamsBase with params = config.params; marketParams = config.marketParams
+  debug ("Proposed " <> input.proposalId <> ": " <> input.market <> " borrowCollateralFactor -> " <> show input.factor)
+  pure a
+
+-- IDE ledger ------------------------------------------------------------------------
+
+-- | What DecMan leaves behind, on the IDE ledger: a party with 2-of-3 GovernanceRules.
+-- On a LocalNet the rules are created by DecMan's contracts workflow, signed by the
+-- party's owner keys, not by a plain submit.
+ideSetup : Text -> Script LocalNetInput
+ideSetup prefix = do
+  decParty <- allocateParty (prefix <> "DecentralizedParty")
+  members <- forA ["MemberP1", "MemberP2", "MemberP3"] (allocateParty . (prefix <>))
+  rulesCid <- submit decParty $ createCmd GovernanceRules with
+    governanceParty = decParty; members = Set.fromList members; threshold = 2
+    actionConfirmationTimeout = hours 1; additionalProposers = None
+  pure LocalNetInput with decParty; rulesCid; members; prefix; ledgerUser = None
+
+test_localNetOnIde : Script ()
+test_localNetOnIde = do
+  input <- ideSetup "ide-"
+  r <- runOnExisting input
+  assertMsg "council of one decentralized party" (r.governors == [input.decParty])
+  assertMsg "factor 0.5 -> 0.45" (r.factorBefore == 0.5 && r.factorAfter == 0.45)
+  assertMsg "the operator alone cannot change params" (r.operatorAloneUpdate == "REJECTED")
+  assertMsg "one confirmation is not enough" (r.executeWithOneConfirmation == "REJECTED")
+  assertMsg "borrow above the new limit rejected" (r.borrowAboveLimit == "REJECTED")
+  assertMsg "borrow within the new limit accepted" (r.borrowWithinLimit == "accepted")
+
+-- | Input validation: rules of another party, foreign members or threshold 1 are refused.
+test_localNetRejectsForeignRules : Script ()
+test_localNetRejectsForeignRules = do
+  input <- ideSetup "bad-"
+  other <- allocateParty "bad-Other"
+  Some rules <- queryContractId input.decParty input.rulesCid
+  assertMsg "DecMan rules accepted" (rulesProblem input (Some rules) == None)
+  assertMsg "missing rules refused" (isSome (rulesProblem input None))
+  assertMsg "foreign party refused" (isSome (rulesProblem (input with decParty = other) (Some rules)))
+  assertMsg "foreign members refused" (isSome (rulesProblem (input with members = drop 1 input.members) (Some rules)))
+  assertMsg "threshold 1 refused" (isSome (rulesProblem input (Some rules with threshold = 1)))
+  assertMsg "threshold above the member count refused" (isSome (rulesProblem input (Some rules with threshold = 4)))
+  assertMsg "threshold 3 of 3 accepted" (rulesProblem input (Some rules with threshold = 3) == None)

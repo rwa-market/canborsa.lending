@@ -1,0 +1,16 @@
+sdk-version: 3.5.12
+name: lending-decman
+source: daml
+version: 0.2.5
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../vendor/splice-api-token-metadata-v1-1.0.0.dar
+  - ../vendor/splice-api-token-holding-v1-1.0.0.dar
+  - ../vendor/splice-api-token-transfer-instruction-v1-1.0.0.dar
+  - ../vendor/splice-api-featured-app-v1-1.0.0.dar
+  # BitSafe Decentralization Manager (DLC-link/decentralization-manager@e08d9a4, releases/v1)
+  - ../vendor/governance-action-v1-0.1.0.dar
+  - ../lending-core-v2/.daml/dist/lending-core-v2-1.0.3.dar
+  - ../lending-governance-v2/.daml/dist/lending-governance-v2-1.0.4.dar

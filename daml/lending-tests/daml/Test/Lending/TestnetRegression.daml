@@ -1,0 +1,775 @@
+-- | Regression for the 2026-09-30 pre-TestNet review (docs/reports/audit-2026-09-30-testnet).
+-- Auditor PoCs (PocReview.daml) are inverted: the attack or deadlock must be rejected.
+-- For each new choice: an allowed and a rejected controller.
+module Test.Lending.TestnetRegression where
+
+import DA.Action (foldlA)
+import DA.Foldable (forA_)
+import DA.Foldable qualified as F
+import DA.List (head)
+import DA.Numeric (cast, mul)
+import DA.Map qualified as Map
+import DA.Optional (isSome)
+import DA.Text (isInfixOf)
+import DA.Time (addRelTime, days, minutes, seconds, time)
+import DA.Date (Month (..), date)
+import Daml.Script
+
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight)
+import Splice.Api.Token.HoldingV1 qualified as H
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+import Splice.Testing.Tokens.TestTokenV1 (TokenRules (..))
+
+import Lending.Account
+import Lending.Auth
+import Lending.Config
+import Lending.Deploy.Prod
+import Lending.Governance
+import Lending.Math
+import Lending.Oracle
+import Lending.Pause
+import Lending.Pool
+import Lending.Rates
+import Lending.Types
+import Test.Lending.Env
+import Test.Lending.GovernanceTest (Council (..), setupCouncil)
+import Test.Lending.MockRewards
+
+-- Shared helpers -----------------------------------------------------------------
+
+-- | Council proposal from the current config with explicit changes.
+proposeFull : Env -> Council -> Party -> Text -> (ProtocolConfig -> ProtocolConfig)
+  -> Optional Roles -> Script (ContractId ParameterChangeProposal)
+proposeFull env c proposer proposalId f newRoles = do
+  (configCid, config) <- currentConfig env
+  let target = f config
+  now <- getTime
+  submit proposer $ exerciseCmd c.cid Council_Propose with
+    proposer; proposalId; description = proposalId; configCid
+    newParams = target.params; newMarketParams = target.marketParams
+    newTransferFactories = None; expiresAt = addRelTime now (days 1)
+    featuredAppRightChange = None; newRoles
+
+approve : Party -> ContractId ParameterChangeProposal -> Script (ContractId ParameterChangeProposal)
+approve member p = submit member $ exerciseCmd p Proposal_Approve with approver = member
+
+-- | The submission error contains the text.
+failsWith : Text -> Either SubmitError a -> Script ()
+failsWith msg r = case r of
+  Left e -> assertMsg ("expected \"" <> msg <> "\", got: " <> show e) (msg `isInfixOf` show e)
+  Right _ -> abort ("expected failure: " <> msg)
+
+-- | Replace the pool with a new one in the given state (only the operator signs the pool).
+replacePoolState : Env -> (PoolState -> PoolState) -> Script ()
+replacePoolState env f = do
+  (poolCid, pool) <- currentPool env
+  submit env.operator $ archiveCmd poolCid
+  _ <- submit env.operator $ createCmd pool with state = f pool.state
+  pure ()
+
+-- | Replace the config (without a council only the operator signs it).
+replaceConfig : Env -> (ProtocolConfig -> ProtocolConfig) -> Script ()
+replaceConfig env f = do
+  (configCid, config) <- currentConfig env
+  submit env.operator $ archiveCmd configCid
+  _ <- submit env.operator $ createCmd (f config)
+  pure ()
+
+-- D-3: the market set in the config does not change -----------------------------------
+
+-- PoC test_poc_addMarketBricksPool, inverted: the council threshold cannot add a market;
+-- repayment, supply and liquidation keep working.
+test_d3_marketSetChangeRejected : Script ()
+test_d3_marketSetChangeRejected = do
+  env <- setup
+  seedLiquidity env 20000.0
+  setPrice env env.cc 0.4
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  c <- setupCouncil env
+  add <- proposeFull env c c.m1 "add-cc2"
+    (\cfg -> cfg with marketParams = Map.insert "CC2" (ccMarketParams env.cc) cfg.marketParams) None
+  add' <- approve c.m2 add
+  (configCid, _) <- currentConfig env
+  r <- trySubmit c.m2 $ exerciseCmd add' Proposal_Execute with executor = c.m2; configCid
+  failsWith "market set cannot change" r
+  -- the trusted path does not add a market either
+  submitMustFail env.operator $ exerciseCmd add' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  -- removing a market is not allowed either
+  del <- proposeFull env c c.m1 "remove-cbtc" (\cfg -> cfg with marketParams = Map.delete "CBTC" cfg.marketParams) None
+  del' <- approve c.m2 del
+  submitMustFail c.m2 $ exerciseCmd del' Proposal_Execute with executor = c.m2; configCid
+  -- the protocol is alive: repayment, supply, absorb
+  run env env.bob (supplyCmd env env.bob 10.0)
+  run env env.alice (supplyCmd env env.alice 10.0)
+  setPrice env env.cc 0.2
+  absorb env env.bob
+
+-- D-4: absorb credits at the quote midpoint ------------------------------------------
+
+-- | Bob: 10 000 CC at $0.40 and a 1 000 USDCx loan.
+bobAtForty : Script Env
+bobAtForty = do
+  env <- setup
+  seedLiquidity env 20000.0
+  setPrice env env.cc 0.4
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  pure env
+
+-- The trigger is the lower quote (conservative), the credit the midpoint 0.2275, not 0.215.
+test_d4_absorbCreditsAtMidQuote : Script ()
+test_d4_absorbCreditsAtMidQuote = do
+  env <- bobAtForty
+  setPrices env env.cc 0.24 0.215
+  absorb env env.bob
+  -- 10 000 × 0.2275 × 0.93 = 2 115.75 credited against 1 000 of debt
+  (_, pool) <- currentPool env
+  (_, bob) <- accountOf env env.bob
+  approxEq "credited at the mid quote" 0.0 1115.75 (accountBalance pool.state bob)
+  m <- marketOf env "CC"
+  approxEq "book value" 0.0 2115.75 m.protocolCollateralBasis
+
+-- Healthy at the lower quote: not absorbed, whatever the midpoint.
+test_d4_healthyAtTriggerNotAbsorbed : Script ()
+test_d4_healthyAtTriggerNotAbsorbed = do
+  env <- bobAtForty
+  -- lower quote 0.23: point 1 035 above the debt, although the midpoint 0.235 is no higher
+  setPrices env env.cc 0.24 0.23
+  absorbMustFail env env.bob
+
+-- D-6: Login_Reap and maxLoginTtl ---------------------------------------------------
+
+-- PoC test_poc_farFutureLoginSticks, inverted: the operator reaps logins "until year 2100"
+-- and without expiry, but leaves an honest login alone; the user cannot execute Login_Reap.
+test_d6_loginReap : Script ()
+test_d6_loginReap = do
+  env <- setup
+  far <- forA [1 .. 20 : Int] \i -> submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "n" <> show i
+    expiresAt = Some (time (date 2100 Jan 1) 0 0 0)
+  legacy <- submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "legacy"; expiresAt = None
+  now <- getTime
+  honest <- submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "ok"; expiresAt = Some (addRelTime now maxLoginTtl)
+  tooLong <- submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "long"
+    expiresAt = Some (addRelTime now (maxLoginTtl + seconds 1))
+  -- a far expiry and a missing expiry are not redeemed for a session
+  forA_ [head far, legacy, tooLong] \cid -> do
+    r <- trySubmit env.operator $ exerciseCmd cid Login_Consume
+    failsWith "maxLoginTtl" r
+  -- a non-operator does not reap others' logins
+  submitMustFail env.bob $ exerciseCmd (head far) Login_Reap
+  submitMustFail env.alice $ exerciseCmd (head far) Login_Reap
+  -- Login_Reap leaves an honest login (exactly maxLoginTtl) alone, and it is redeemed for a session
+  r <- trySubmit env.operator $ exerciseCmd honest Login_Reap
+  failsWith "within maxLoginTtl" r
+  forA_ (tooLong :: legacy :: far) \cid -> submit env.operator $ exerciseCmd cid Login_Reap
+  nonce <- submit env.operator $ exerciseCmd honest Login_Consume
+  assertMsg "honest login consumed" (nonce == "ok")
+  logins <- query @Login env.operator
+  assertMsg "operator ACS is clean" (null logins)
+
+-- D-10: parameter bounds and roles --------------------------------------------------
+
+test_d10_parameterBounds : Script ()
+test_d10_parameterBounds = do
+  env <- setup
+  let p = defaultProtocolParams env.usdcx
+      m = cbtcMarketParams env.cbtc
+      ok x = null (validateProtocolParams x)
+      okM x = null (validateMarketParams x)
+  assertMsg "prod defaults valid" (ok (prodProtocolParams env.usdcx))
+  assertMsg "price age 900 ok" (ok p with maxPriceAgeSeconds = 900.0)
+  assertMsg "price age above 900 rejected" (not (ok p with maxPriceAgeSeconds = 900.000000000000000001))
+  assertMsg "price age 1e9 rejected" (not (ok p with maxPriceAgeSeconds = 1000000000.0))
+  assertMsg "skew 120 ok" (ok p with maxClockSkewSeconds = 120.0)
+  assertMsg "skew above 120 rejected" (not (ok p with maxClockSkewSeconds = 120.000000000000000001))
+  assertMsg "depeg 0.1 ok" (ok p with maxDebtDepeg = 0.1)
+  assertMsg "depeg above 0.1 rejected" (not (ok p with maxDebtDepeg = 0.100000000000000001))
+  assertMsg "depeg 0 rejected" (not (ok p with maxDebtDepeg = 0.0))
+  assertMsg "risk warning 1 rejected" (not (ok p with liquidationRiskWarning = 1.0))
+  assertMsg "risk warning 0 rejected" (not (ok p with liquidationRiskWarning = 0.0))
+  assertMsg "attestation 7 days ok" (okM m with maxAttestationAgeSeconds = 604800.0)
+  assertMsg "attestation above 7 days rejected" (not (okM m with maxAttestationAgeSeconds = 604800.000000000000000001))
+  assertMsg "attestation 0 rejected" (not (okM m with maxAttestationAgeSeconds = 0.0))
+  -- a config with such parameters is not created
+  (configCid, config) <- currentConfig env
+  submitMustFail env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params with maxPriceAgeSeconds = 1000000000.0
+    newMarketParams = config.marketParams; newTransferFactories = None; newFeaturedAppRight = None; newRoles = None
+
+test_d10_rolesDistinct : Script ()
+test_d10_rolesDistinct = do
+  env <- setup
+  (_, config) <- currentConfig env
+  let r = config.roles
+      bad = [ r with guardian = r.oracle
+            , r with treasury = r.operator
+            , r with backstop = r.guardian
+            , r with liquidators = []
+            , r with liquidators = [env.liquidator, env.liquidator]
+            , r with liquidators = [r.backstop]
+            , r with liquidators = [r.operator] ]
+  assertMsg "env roles valid" (null (validateRoles r))
+  forA_ bad \roles -> do
+    assertMsg ("rejected: " <> show roles) (not (null (validateRoles roles)))
+    submitMustFail env.operator $ createCmd config with roles
+  -- a council made of a role party does not adopt the config
+  m1 <- allocateParty "M1"
+  councilCid <- submit (actAs [env.operator, m1, env.oracle]) $ createCmd GovernanceCouncil with
+    operator = env.operator; members = [m1, env.oracle]; threshold = 1
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  submitMustFail env.operator $ exerciseCmd councilCid Council_Adopt with configCid; poolCid
+
+-- Disabling CBTC reserve attestation is not allowed by threshold, allowed via the trusted path.
+test_d10_attestationNotDisabledByThreshold : Script ()
+test_d10_attestationNotDisabledByThreshold = do
+  env <- setup
+  c <- setupCouncil env
+  p <- proposeFull env c c.m1 "no-por"
+    (\cfg -> cfg with marketParams = Map.alter (fmap (\m -> m with requiresReserveAttestation = False)) "CBTC" cfg.marketParams) None
+  p' <- approve c.m2 p
+  (configCid, _) <- currentConfig env
+  r <- trySubmit c.m2 $ exerciseCmd p' Proposal_Execute with executor = c.m2; configCid
+  failsWith "disabling reserve attestation" r
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  _ <- submit env.operator $ exerciseCmd p' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "attestation off by the trusted path" (not mp.requiresReserveAttestation)
+  -- re-enabling is allowed by threshold
+  q <- proposeFull env c c.m1 "por-on"
+    (\cfg -> cfg with marketParams = Map.alter (fmap (\m -> m with requiresReserveAttestation = True)) "CBTC" cfg.marketParams) None
+  q' <- approve c.m3 q
+  (configCid', _) <- currentConfig env
+  _ <- submit c.m3 $ exerciseCmd q' Proposal_Execute with executor = c.m3; configCid = configCid'
+  mp' <- marketParamsFor env "CBTC"
+  assertMsg "attestation back on" mp'.requiresReserveAttestation
+
+-- D-11: collateral withdrawal during a USDCx depeg -----------------------------------
+
+test_d11_withdrawCollateralValuesDebtAtLeastOne : Script ()
+test_d11_withdrawCollateralValuesDebtAtLeastOne = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.carol (depositCmd env env.carol "CC" 10000.0)
+  run env env.carol (borrowCmd env env.carol 500.0)
+  -- USDCx 0.97 on both sources: at the quote up to 1916.67 CC could be withdrawn,
+  -- but debt is valued at no less than $1: only up to 1666.67 CC (LTV 30% at CC $0.20)
+  setPrice env env.usdcx 0.97
+  mustFail env env.carol (withdrawCollateralCmd env env.carol "CC" 1800.0)
+  mustFail env env.carol (withdrawCollateralCmd env env.carol "CC" 1666.67)
+  run env env.carol (withdrawCollateralCmd env env.carol "CC" 1666.66)
+  -- without debt withdrawal during depeg is open
+  run env env.bob (depositCmd env env.bob "CC" 100.0)
+  run env env.bob (withdrawCollateralCmd env env.bob "CC" 100.0)
+
+-- D-1: DSO Featured App rights -----------------------------------------------------
+
+test_d1_featuredRightFromConfiguredDsoOnly : Script ()
+test_d1_featuredRightFromConfiguredDsoOnly = do
+  env <- setup
+  dso <- allocateParty "DSO"
+  fakeDso <- allocateParty "FakeDSO"
+  replaceConfig env (\c -> c with dso = Some dso)
+  fake <- submit fakeDso $ createCmd MockFeaturedAppRight with dso = fakeDso; provider = env.operator
+  real <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = env.operator
+  let fakeCid = toInterfaceContractId @FeaturedAppRight fake
+      realCid = toInterfaceContractId @FeaturedAppRight real
+  (configCid, config) <- currentConfig env
+  r <- trySubmit env.operator $ exerciseCmd configCid Config_SetFeaturedAppRight with newFeaturedAppRight = Some fakeCid
+  failsWith "not issued by the configured DSO" r
+  submitMustFail env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = Some fakeCid; newRoles = None
+  -- a right not for the operator is rejected even from the real DSO
+  other <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = env.alice
+  submitMustFail env.operator $ exerciseCmd configCid Config_SetFeaturedAppRight with
+    newFeaturedAppRight = Some (toInterfaceContractId @FeaturedAppRight other)
+  -- only the operator sets it
+  submitMustFail env.alice $ exerciseCmd configCid Config_SetFeaturedAppRight with newFeaturedAppRight = Some realCid
+  _ <- submit env.operator $ exerciseCmd configCid Config_SetFeaturedAppRight with newFeaturedAppRight = Some realCid
+  run env env.alice (supplyCmd env env.alice 100.0)
+  markers <- query @MockActivityMarker env.operator
+  assertMsg "marker created under the configured DSO" (map (.dso) (map snd markers) == [dso])
+
+-- D-1: prod deploy without mocks ---------------------------------------------------
+
+-- | Parties and registries for deployProd. The registries are splice-test-token (Daml Script has no others),
+-- but the script treats them as external: only InstrumentId and the factory.
+prodEnv : Bool -> Script (ProdInput, Env, [Party])
+prodEnv hostedHere = do
+  let p = allocateParty
+  operator <- p "P-Operator"; oracle <- p "P-Oracle"; guardian <- p "P-Guardian"
+  treasury <- p "P-Treasury"; backstop <- p "P-Backstop"; liquidator <- p "P-Liquidator"
+  alice <- p "P-Alice"; bob <- p "P-Bob"; carol <- p "P-Carol"
+  dso <- p "P-DSO"
+  members <- forA [1 .. 3 : Int] \i -> p ("P-Member" <> show i)
+  admins <- forA ["UsdcxRegistry", "CcRegistry", "CbtcRegistry"] \n -> p ("P-" <> n)
+  (usdcx, cc, cbtc) <- case admins of
+    [a, b, c] -> pure (H.InstrumentId a "USDCx", H.InstrumentId b "CC", H.InstrumentId c "CBTC")
+    _ -> abort "three registries"
+  let rules i = submit i.admin (createCmd TokenRules with admin = i.admin)
+  ru <- rules usdcx
+  rc <- rules cc
+  rb <- rules cbtc
+  right <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = operator
+  let asset i r price = AssetInput with
+        instrument = i; transferFactory = toInterfaceContractId @TransferFactory r; bootstrapPrice = price
+      input = ProdInput with
+        operator; oracle; guardian; treasury; backstop; liquidators = [liquidator]
+        usdcx = asset usdcx ru 1.0; cc = asset cc rc 0.2; cbtc = asset cbtc rb 100000.0
+        dso; featuredAppRight = Some (toInterfaceContractId @FeaturedAppRight right)
+        council = members; councilThreshold = 2; councilHostedHere = hostedHere
+        params = None; ccMarket = None; cbtcMarket = None
+      env = Env with
+        operator; oracle; guardian; treasury; backstop; liquidator; alice; bob; carol
+        testers = []; council = members; usdcx; cc; cbtc
+  pure (input, env, members)
+
+test_d1_deployProd : Script ()
+test_d1_deployProd = do
+  (input, env, members) <- prodEnv True
+  out <- deployProd input
+  assertMsg "output shape" (out.operator == env.operator && out.liquidator == env.liquidator
+    && out.usdcx == env.usdcx && out.cc == env.cc && out.cbtc == env.cbtc && null out.testers
+    && out.councilRotationId == None && out.dso == input.dso)
+  (_, config) <- currentConfig env
+  (_, pool) <- currentPool env
+  assertMsg "governed by the council" (config.governors == members && pool.governors == members)
+  assertMsg "DSO configured" (config.dso == Some input.dso && isSome config.featuredAppRight)
+  assertMsg "prod params" (config.params == prodProtocolParams env.usdcx)
+  pauses <- query @PauseState env.operator
+  assertMsg "pause flags for the guardian" (map ((.guardian) . snd) pauses == [env.guardian])
+  councils <- query @GovernanceCouncil env.operator
+  assertMsg "council 2 of 3" (map ((.threshold) . snd) councils == [2])
+  -- the script created no mock token or registry: the registries only have their TokenRules
+  forA_ [env.usdcx, env.cc, env.cbtc] \i -> do
+    hs <- queryInterface @H.Holding i.admin
+    assertMsg "no tokens minted by the deploy" (null hs)
+  -- initial feed prices are stale: borrowing fails until the oracle updates the prices
+  mint env env.usdcx env.alice 100000.0
+  mint env env.cc env.bob 20000.0
+  mint env env.usdcx env.treasury 15000.0
+  forA_ [env.alice, env.bob] (openAccount env)
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  mustFail env env.bob (borrowCmd env env.bob 250.0)
+  refreshPrices env
+  run env env.bob (borrowCmd env env.bob 250.0)
+  run env env.bob (supplyCmd env env.bob 250.0)
+  markers <- query @MockActivityMarker env.operator
+  assertMsg "markers under the configured DSO" (not (null markers) && F.all ((== input.dso) . (.dso) . snd) markers)
+
+-- Council of external parties: the script only creates the rotation, the members sign themselves.
+test_d1_deployProdExternalCouncil : Script ()
+test_d1_deployProdExternalCouncil = do
+  (input, env, members) <- prodEnv False
+  out <- deployProd input
+  assertMsg "formation pending" (out.councilRotationId == Some formationId)
+  (_, config) <- currentConfig env
+  assertMsg "not governed yet" (null config.governors)
+  [(rotationCid, _)] <- query @CouncilRotation env.operator
+  (m1, m2, m3) <- case members of
+    [a, b, c] -> pure (a, b, c)
+    _ -> abort "three members"
+  -- a non-member does not join
+  submitMustFail env.alice $ exerciseCmd rotationCid Rotation_Join with joiner = env.alice
+  r1 <- submit m1 $ exerciseCmd rotationCid Rotation_Join with joiner = m1
+  submitMustFail m1 $ exerciseCmd r1 Rotation_Join with joiner = m1
+  r2 <- submit m2 $ exerciseCmd r1 Rotation_Join with joiner = m2
+  -- without the third signature the council is not adopted
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  submitMustFail env.operator $ exerciseCmd r2 Rotation_Execute with
+    executor = env.operator; councilCid = None; configCid; poolCid
+  _ <- submit m3 $ exerciseCmd r2 Rotation_Join with joiner = m3
+  -- only the operator can execute the formation (there are no old council members)
+  [(r3, _)] <- query @CouncilRotation env.operator
+  asUserMustFail env m1 $ exerciseCmd r3 Rotation_Execute with executor = m1; councilCid = None; configCid; poolCid
+  executeCouncilFormation FormationInput with operator = env.operator; rotationId = formationId
+  (_, governed) <- currentConfig env
+  (_, pool) <- currentPool env
+  assertMsg "council adopted" (governed.governors == members && pool.governors == members)
+
+-- A-3: the operator alone does not detach the pool from the council -------------------
+
+test_a3_operatorCannotRepointPool : Script ()
+test_a3_operatorCannotRepointPool = do
+  env <- setup
+  seedLiquidity env 1000.0
+  c <- setupCouncil env
+  (poolCid, _) <- currentPool env
+  (configCid, config) <- currentConfig env
+  -- the operator alone does not remove the council from the pool
+  submitMustFail env.operator $ exerciseCmd poolCid Pool_SetGovernors with newGovernors = []
+  -- nor does the council threshold without the operator
+  submitMustFail (actAs [c.m1, c.m2]) $ exerciseCmd poolCid Pool_SetGovernors with newGovernors = []
+  (accountCid, _) <- accountOf env env.alice
+  payment <- transferArgs env.alice env.usdcx
+  ds <- disclosures env
+  -- the pool does not accept the operator's shadow config without the council
+  shadow <- submit env.operator $ createCmd config with governors = []
+  shadowD <- queryDisclosure env.operator shadow
+  r <- trySubmit (actAs env.alice <> discloseMany (optional ds (:: ds) shadowD)) $ exerciseCmd poolCid Pool_SupplyBase with
+    user = env.alice; configCid = shadow; accountCid; amount = 10.0; full = False; payment
+  failsWith "not signed by the pool's council" r
+  -- works with the real config
+  _ <- submit (actAs env.alice <> discloseMany ds) $ exerciseCmd poolCid Pool_SupplyBase with
+    user = env.alice; configCid; accountCid; amount = 10.0; full = False; payment
+  pure ()
+
+-- D-5, A-13: role rotation -------------------------------------------------------------
+
+test_d5_roleRotation : Script ()
+test_d5_roleRotation = do
+  env <- setup
+  seedLiquidity env 20000.0
+  c <- setupCouncil env
+  newOracle <- allocateParty "NewOracle"
+  newGuardian <- allocateParty "NewGuardian"
+  liquidator2 <- allocateParty "Liquidator2"
+  (_, config) <- currentConfig env
+  let roles' = config.roles with
+        oracle = newOracle; guardian = newGuardian; liquidators = [env.liquidator, liquidator2]
+  -- the operator cannot be changed
+  (configCid0, _) <- currentConfig env
+  now <- getTime
+  submitMustFail c.m1 $ exerciseCmd c.cid Council_Propose with
+    proposer = c.m1; proposalId = "op"; description = "op"; configCid = configCid0
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    expiresAt = addRelTime now (days 1); featuredAppRightChange = None
+    newRoles = Some (config.roles with operator = env.alice)
+  p <- proposeFull env c c.m1 "rotate-roles" identity (Some roles')
+  stale <- proposeFull env c c.m2 "rotate-roles-2" identity (Some (config.roles with treasury = env.carol))
+  -- one approval: the operator does not execute
+  submitMustFail env.operator $ exerciseCmd p Proposal_ExecuteTrusted with configCid = configCid0; pauseCid = None
+  p' <- approve c.m2 p
+  -- the threshold without the operator does not change roles
+  r <- trySubmit c.m2 $ exerciseCmd p' Proposal_Execute with executor = c.m2; configCid = configCid0
+  failsWith "role change needs the operator" r
+  -- a council member does not execute the trusted path
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_ExecuteTrusted with configCid = configCid0; pauseCid = None
+  submitMustFail env.alice $ exerciseCmd p' Proposal_ExecuteTrusted with configCid = configCid0; pauseCid = None
+  _ <- submit env.operator $ exerciseCmd p' Proposal_ExecuteTrusted with configCid = configCid0; pauseCid = None
+  (configCid1, rotated) <- currentConfig env
+  assertMsg "roles rotated" (rotated.roles == roles' && rotated.governors == config.governors)
+  -- the second proposal from the old role base is stale
+  stale' <- approve c.m3 stale
+  submitMustFail env.operator $ exerciseCmd stale' Proposal_ExecuteTrusted with configCid = configCid1; pauseCid = None
+  -- feeds of the new oracle
+  forA_ [(env.usdcx, 1.0), (env.cc, 0.2), (env.cbtc, 100000.0)] \(instrumentId, price) -> do
+    t <- getTime
+    submit newOracle $ createCmd PriceFeed with
+      oracle = newOracle; instrumentId
+      quotes = [PriceQuote "source-a" price t, PriceQuote "source-b" price t]
+      observers = [env.operator]
+  t <- getTime
+  _ <- submit newOracle $ createCmd ReserveAttestation with
+    oracle = newOracle; instrumentId = env.cbtc; coverage = 1.0; attestedAt = t; observers = [env.operator]
+  let env' = env with oracle = newOracle; guardian = newGuardian
+  -- collateral needs no price; the old oracle's prices no longer authorize a loan, the new one's do
+  run env' env.bob (depositCmd env' env.bob "CC" 10000.0)
+  mustFail env env.bob (borrowCmd env env.bob 250.0)
+  -- the pause flags are still the old guardian's: pausable operations wait for the operator's rebind
+  mustFail env' env.bob (borrowCmd env' env.bob 250.0)
+  (pauseCid, _) <- currentPause env
+  submitMustFail env.guardian $ exerciseCmd pauseCid PauseState_Rebind with configCid = configCid1
+  _ <- submit env.operator $ exerciseCmd pauseCid PauseState_Rebind with configCid = configCid1
+  -- the old guardian no longer pauses, the new one does
+  (pauseCid', _) <- currentPause env
+  submitMustFail env.guardian $ exerciseCmd pauseCid' PauseState_Set with newFlags = noPause with borrowPaused = True
+  setPauseFlags env' (\f -> f with borrowPaused = True)
+  mustFail env' env.bob (borrowCmd env' env.bob 250.0)
+  setPauseFlags env' (const noPause)
+  run env' env.bob (borrowCmd env' env.bob 250.0)
+  -- the new liquidator buys absorbed collateral
+  setPrice env' env.cc 0.02
+  absorb env' env.bob
+  mint env env.usdcx liquidator2 100.0
+  run env' liquidator2 (buyCmd env' liquidator2 "CC" 10.0 0.0)
+
+-- D-5: the factory is rotated by threshold with the operator when one council key is lost.
+test_d5_factoryRotationWithLostKey : Script ()
+test_d5_factoryRotationWithLostKey = do
+  env <- setup
+  c <- setupCouncil env
+  -- a second TokenRules of the USDCx registry: the "new factory" after the registry's rotation
+  newRules <- submit env.usdcx.admin (createCmd TokenRules with admin = env.usdcx.admin)
+  (configCid, config) <- currentConfig env
+  let factories = Map.insert env.usdcx (toInterfaceContractId @TransferFactory newRules) config.transferFactories
+  now <- getTime
+  p <- submit c.m1 $ exerciseCmd c.cid Council_Propose with
+    proposer = c.m1; proposalId = "rotate-factory"; description = "registry rotated its factory"; configCid
+    newParams = config.params; newMarketParams = config.marketParams
+    newTransferFactories = Some factories; expiresAt = addRelTime now (days 1)
+    featuredAppRightChange = None; newRoles = None
+  -- m3 lost its key: only m1 and m2 approve
+  p' <- approve c.m2 p
+  submitMustFail c.m2 $ exerciseCmd p' Proposal_Execute with executor = c.m2; configCid
+  _ <- submit env.operator $ exerciseCmd p' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  (_, rotated) <- currentConfig env
+  assertMsg "factory rotated without the lost key" (rotated.transferFactories == factories)
+
+-- D-5: council rotation with a lost key ------------------------------------------------
+
+test_d5_councilRotation : Script ()
+test_d5_councilRotation = do
+  env <- setup
+  seedLiquidity env 1000.0
+  c <- setupCouncil env
+  m4 <- allocateParty "Member4"
+  now <- getTime
+  let exp = addRelTime now (days 2)
+      rotate proposer = exerciseCmd c.cid Council_ProposeRotation with
+        proposer; rotationId = "replace-m3"; newMembers = [c.m1, c.m2, m4]; newThreshold = 2; expiresAt = exp
+  -- a non-member does not propose a rotation
+  submitMustFail c.outsider (rotate c.outsider)
+  submitMustFail m4 (rotate m4)
+  -- an invalid composition is rejected
+  submitMustFail c.m1 $ exerciseCmd c.cid Council_ProposeRotation with
+    proposer = c.m1; rotationId = "bad"; newMembers = [c.m1, env.operator]; newThreshold = 1; expiresAt = exp
+  submitMustFail c.m1 $ exerciseCmd c.cid Council_ProposeRotation with
+    proposer = c.m1; rotationId = "bad"; newMembers = [c.m1]; newThreshold = 2; expiresAt = exp
+  -- a parametric proposal of the old council, which will become stale
+  old <- proposeFull env c c.m1 "old-ltv" (\cfg -> cfg with marketParams = Map.alter (fmap (\m -> m with borrowCollateralFactor = 0.4)) "CBTC" cfg.marketParams) None
+  old' <- approve c.m2 old
+  r0 <- submit c.m1 (rotate c.m1)
+  -- approval: only a member, only once
+  submitMustFail m4 $ exerciseCmd r0 Rotation_Approve with approver = m4
+  submitMustFail c.m1 $ exerciseCmd r0 Rotation_Approve with approver = c.m1
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  let execute executor rot = exerciseCmd rot Rotation_Execute with
+        executor; councilCid = Some c.cid; configCid; poolCid
+  -- one approval out of two
+  asUserMustFail env c.m1 (execute c.m1 r0)
+  r1 <- submit c.m2 $ exerciseCmd r0 Rotation_Approve with approver = c.m2
+  -- the new member has not signed yet
+  asUserMustFail env c.m1 (execute c.m1 r1)
+  -- only the new member joins, nobody joins on its behalf
+  submitMustFail c.outsider $ exerciseCmd r1 Rotation_Join with joiner = c.outsider
+  submitMustFail c.m1 $ exerciseCmd r1 Rotation_Join with joiner = c.m1
+  submitMustFail c.m1 $ exerciseCmd r1 Rotation_Join with joiner = m4
+  r2 <- submit m4 $ exerciseCmd r1 Rotation_Join with joiner = m4
+  -- executed by the operator or an old council member, not an outsider or the newcomer
+  asUserMustFail env c.outsider (execute c.outsider r2)
+  asUserMustFail env m4 (execute m4 r2)
+  (newCouncilCid, configCid', _) <- asUser env c.m1 (execute c.m1 r2)
+  (_, config) <- currentConfig env
+  (_, pool) <- currentPool env
+  assertMsg "config and pool follow the new council"
+    (config.governors == [c.m1, c.m2, m4] && pool.governors == [c.m1, c.m2, m4])
+  gone <- queryContractId env.operator c.cid
+  assertMsg "old council archived" (gone == None)
+  -- the old council's proposal no longer executes
+  submitMustFail c.m2 $ exerciseCmd old' Proposal_Execute with executor = c.m2; configCid = configCid'
+  -- the new council works by threshold m1 + m4, m3 is not in it
+  let c' = c with cid = newCouncilCid
+  submitMustFail c.m3 $ exerciseCmd newCouncilCid Council_Propose with
+    proposer = c.m3; proposalId = "m3"; description = "m3"; configCid = configCid'
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    expiresAt = exp; featuredAppRightChange = None; newRoles = None
+  p <- proposeFull env c' m4 "new-ltv" (\cfg -> cfg with marketParams = Map.alter (fmap (\m -> m with borrowCollateralFactor = 0.45)) "CBTC" cfg.marketParams) None
+  p' <- approve c.m1 p
+  _ <- submit m4 $ exerciseCmd p' Proposal_Execute with executor = m4; configCid = configCid'
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "new council changed LTV" (mp.borrowCollateralFactor == 0.45)
+  run env env.alice (supplyCmd env env.alice 10.0)
+
+test_d5_rotationExpiresAndWithdraws : Script ()
+test_d5_rotationExpiresAndWithdraws = do
+  env <- setup
+  c <- setupCouncil env
+  m4 <- allocateParty "Member4"
+  now <- getTime
+  r0 <- submit c.m1 $ exerciseCmd c.cid Council_ProposeRotation with
+    proposer = c.m1; rotationId = "r"; newMembers = [c.m1, c.m2, m4]; newThreshold = 2
+    expiresAt = addRelTime now (days 1)
+  r1 <- submit c.m2 $ exerciseCmd r0 Rotation_Approve with approver = c.m2
+  r2 <- submit m4 $ exerciseCmd r1 Rotation_Join with joiner = m4
+  passTime (days 1)
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  asUserMustFail env c.m1 $ exerciseCmd r2 Rotation_Execute with
+    executor = c.m1; councilCid = Some c.cid; configCid; poolCid
+  submitMustFail c.m2 $ exerciseCmd r2 Rotation_Withdraw with actor = c.m2
+  submit c.m1 $ exerciseCmd r2 Rotation_Withdraw with actor = c.m1
+
+-- Council formation: only the operator and only for a config without a council.
+test_d5_councilFormation : Script ()
+test_d5_councilFormation = do
+  env <- setup
+  members <- forA ["F1", "F2", "F3"] allocateParty
+  now <- getTime
+  let formation = CouncilRotation with
+        operator = env.operator; members = []; threshold = 0; rotationId = "f"; proposer = env.operator
+        newMembers = members; newThreshold = 2; expiresAt = addRelTime now (days 1)
+        approvals = []; joined = []
+  -- formation cannot be created without the operator's signature
+  submitMustFail (head members) $ createCmd formation
+  rot <- submit env.operator $ createCmd formation
+  joinedCid <- foldlA (\cid m -> submit m $ exerciseCmd cid Rotation_Join with joiner = m) rot members
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd joinedCid Rotation_Execute with
+    executor = env.operator; councilCid = None; configCid; poolCid
+  (configCid', config) <- currentConfig env
+  assertMsg "formed" (config.governors == members)
+  -- formation on top of a council does not pass
+  others <- forA ["G1", "G2"] allocateParty
+  rot2 <- submit env.operator $ createCmd formation with newMembers = others; rotationId = "g"
+  joined2 <- foldlA (\cid m -> submit m $ exerciseCmd cid Rotation_Join with joiner = m) rot2 others
+  (poolCid', _) <- currentPool env
+  submitMustFail env.operator $ exerciseCmd joined2 Rotation_Execute with
+    executor = env.operator; councilCid = None; configCid = configCid'; poolCid = poolCid'
+
+-- N4: reserves to treasury via the council --------------------------------------------
+
+test_n4_reservesToTreasury : Script ()
+test_n4_reservesToTreasury = do
+  env <- bobAtForty
+  c <- setupCouncil env
+  addReserves env 1000.0
+  passTime (days 30)
+  refreshPrices env
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd poolCid Pool_Accrue with configCid
+  (_, pool) <- currentPool env
+  let available = floorDecimal (reserves pool.state)
+  assertMsg "reserves accrued above the starting 1 000" (available > 1000.0)
+  now <- getTime
+  let propose proposer treasury reservesAmount = exerciseCmd c.cid Council_ProposeIncome with
+        proposer; proposalId = "income"; treasury; reservesAmount; expiresAt = addRelTime now (days 1)
+  -- only a council member proposes
+  submitMustFail env.treasury (propose env.treasury env.treasury available)
+  p <- submit c.m1 (propose c.m1 env.treasury available)
+  (poolCid, _) <- currentPool env
+  reservesPayout <- transferArgs env.operator env.usdcx
+  ds <- disclosures env
+  let execute cid = exerciseCmd cid IncomeProposal_Execute with poolCid; configCid; reservesPayout
+  -- one approval: not executed
+  r <- trySubmit (actAs env.treasury <> discloseMany ds) (execute p)
+  failsWith "not enough approvals" r
+  submitMustFail c.m2 $ exerciseCmd p IncomeProposal_Approve with approver = env.treasury
+  p' <- submit c.m2 $ exerciseCmd p IncomeProposal_Approve with approver = c.m2
+  -- only treasury executes
+  submitMustFail (actAs env.operator <> discloseMany ds) (execute p')
+  submitMustFail (actAs c.m1 <> discloseMany ds) (execute p')
+  -- the operator and treasury do not withdraw directly without the council
+  submitMustFail (actAs [env.operator, env.treasury] <> discloseMany ds) $ exerciseCmd poolCid Pool_WithdrawReserves with
+    treasury = env.treasury; configCid; amount = available; payout = reservesPayout
+  _ <- submit (actAs env.treasury <> discloseMany ds) (execute p')
+  balanceOf env.treasury env.usdcx >>= eqD "reserves paid to treasury" available
+  (_, pool') <- currentPool env
+  approxEq "cash reduced" 0.0 (pool.state.cash - toN available) pool'.state.cash
+  -- cannot withdraw more than the reserves
+  q <- submit c.m1 (propose c.m1 env.treasury 1.0)
+  q' <- submit c.m3 $ exerciseCmd q IncomeProposal_Approve with approver = c.m3
+  (poolCid2, _) <- currentPool env
+  reservesPayout2 <- transferArgs env.operator env.usdcx
+  ds2 <- disclosures env
+  submitMustFail (actAs env.treasury <> discloseMany ds2) $ exerciseCmd q' IncomeProposal_Execute with
+    poolCid = poolCid2; configCid; reservesPayout = reservesPayout2
+  -- the receiver is only the treasury from the config
+  w <- submit c.m1 (propose c.m1 env.carol 0.0000000001)
+  w' <- submit c.m2 $ exerciseCmd w IncomeProposal_Approve with approver = c.m2
+  submitMustFail (actAs env.carol <> discloseMany ds2) $ exerciseCmd w' IncomeProposal_Execute with
+    poolCid = poolCid2; configCid; reservesPayout = reservesPayout2
+
+-- Negative reserves are not withdrawn, even by the council
+test_n4_negativeReservesNotWithdrawn : Script ()
+test_n4_negativeReservesNotWithdrawn = do
+  env <- bobAtForty
+  c <- setupCouncil env
+  setPrice env env.cc 0.05
+  absorb env env.bob
+  (_, pool) <- currentPool env
+  assertMsg "reserves negative" (reserves pool.state < 0.0)
+  now <- getTime
+  p <- submit c.m1 $ exerciseCmd c.cid Council_ProposeIncome with
+    proposer = c.m1; proposalId = "neg"; treasury = env.treasury; reservesAmount = 1.0; expiresAt = addRelTime now (days 1)
+  p' <- submit c.m2 $ exerciseCmd p IncomeProposal_Approve with approver = c.m2
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  reservesPayout <- transferArgs env.operator env.usdcx
+  ds <- disclosures env
+  r <- trySubmit (actAs env.treasury <> discloseMany ds) $ exerciseCmd p' IncomeProposal_Execute with poolCid; configCid; reservesPayout
+  failsWith "reserves are negative" r
+
+-- Without the council reserves are not withdrawn even by the operator together with treasury.
+test_n4_noReservesWithoutCouncil : Script ()
+test_n4_noReservesWithoutCouncil = do
+  env <- bobAtForty
+  addReserves env 100.0
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  reservesPayout <- transferArgs env.operator env.usdcx
+  ds <- disclosures env
+  r <- trySubmit (actAs [env.operator, env.treasury] <> discloseMany ds) $ exerciseCmd poolCid Pool_WithdrawReserves with
+    treasury = env.treasury; configCid; amount = 1.0; payout = reservesPayout
+  failsWith "only under a council" r
+
+-- A-5 / N6: directed rounding of scales ----------------------------------------------
+
+test_n6_directedDivision : Script ()
+test_n6_directedDivision = do
+  assertMsg "1/3 down" (divDown 1.0 3.0 == 0.333333333333333333)
+  assertMsg "1/3 up" (divUp 1.0 3.0 == 0.333333333333333334)
+  assertMsg "2/3 down" (divDown 2.0 3.0 == 0.666666666666666666)
+  assertMsg "2/3 up" (divUp 2.0 3.0 == 0.666666666666666667)
+  assertMsg "exact stays exact" (divDown 1000.0 1.0 == 1000.0 && divUp 1000.0 1.0 == 1000.0)
+  assertMsg "exact at a fractional index" (divDown 1.5 1.5 == 1.0 && divUp 3.0 1.5 == 2.0)
+  assertMsg "zero" (divDown 0.0 1.7 == 0.0 && divUp 0.0 1.7 == 0.0)
+  -- large amounts and an index slightly above 1
+  let a = 123456789.123456789
+      b = 1.000000000000000001
+  assertMsg "large: down <= up" (divDown a b <= divUp a b && divUp a b - divDown a b <= 0.000000000000000001)
+  -- Grid property: the independent oracle is the exact product in Numeric 36 for small
+  -- values (< 10 · 10 < 100 fits in Numeric 36).
+  let grid = [ (fromInt x * 0.013 + 0.000000000000000007 * fromInt y, 1.0 + fromInt y * 0.000000370000000011)
+             | x <- [0 .. 40], y <- [0 .. 25] ]
+      exactMul = mulExact
+  forA_ grid \(x, y) -> do
+    let lo = divDown x y
+        hi = divUp x y
+        cx : Numeric 36 = castN36 x
+    assertMsg ("down*b <= a at " <> show (x, y)) (exactMul lo y <= cx)
+    assertMsg ("(down+e)*b > a at " <> show (x, y)) (exactMul (lo + 0.000000000000000001) y > cx)
+    assertMsg ("up*b >= a at " <> show (x, y)) (exactMul hi y >= cx)
+    assertMsg ("(up-e)*b < a at " <> show (x, y)) (hi == 0.0 || exactMul (hi - 0.000000000000000001) y < cx)
+
+-- Pool: a deposit principal rounds down, a debt principal up.
+test_n6_poolScalesFavourProtocol : Script ()
+test_n6_poolScalesFavourProtocol = do
+  env <- setup
+  replacePoolState env (\s -> s with supplyIndex = 1.5; borrowIndex = 3.0)
+  seedLiquidity env 1000.0
+  (_, alice0) <- accountOf env env.alice
+  assertMsg ("deposit principal rounded down: " <> show alice0.principal) (alice0.principal == 666.666666666666666666)
+  run env env.alice (withdrawCmd env env.alice 1.0)
+  (_, alice1) <- accountOf env env.alice
+  -- (999.999…999 − 1) / 1.5 rounded down
+  assertMsg ("withdrawal leaves the principal rounded down: " <> show alice1.principal) (alice1.principal == 665.999999999999999999)
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  run env env.bob (borrowCmd env env.bob 250.0)
+  (_, bob0) <- accountOf env env.bob
+  -- 250 / 3 = 83.3333…33 up → …34
+  assertMsg ("debt principal rounded up: " <> show bob0.principal) (bob0.principal == -83.333333333333333334)
+  run env env.bob (supplyCmd env env.bob 200.0)
+  (_, bob1) <- accountOf env env.bob
+  assertMsg ("repayment leaves the debt principal rounded up: " <> show bob1.principal) (bob1.principal == -16.666666666666666668)
+  (_, pool) <- currentPool env
+  assertMsg "pool totals match" (pool.state.totalBorrowPrincipal == negate bob1.principal
+    && pool.state.totalSupplyPrincipal == alice1.principal)
+
+castN36 : N -> Numeric 36
+castN36 = cast
+
+-- | Exact product of small numbers: 18 + 18 decimals fit in Numeric 36.
+mulExact : N -> N -> Numeric 36
+mulExact = mul

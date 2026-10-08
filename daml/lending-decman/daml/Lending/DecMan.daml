@@ -1,0 +1,419 @@
+-- | Protocol governance through a BitSafe Decentralized Party (Decentralization Manager, DecMan).
+--
+-- The decentralized party is hosted on the nodes of independent organizations. Its own
+-- `GovernanceRules` (governance-core-v1) collects k-of-n confirmations of the members and then
+-- exercises `GovernableAction_Execute` with the party's authority. The templates here implement
+-- `GovernableAction` and drive the lending council with that authority.
+--
+-- The lending council (`GovernanceCouncil`) has the decentralized party as its only member, threshold 1:
+-- the real threshold is the DecMan one. Everything else stays as in lending-governance: a change that
+-- needs the operator (factories, roles, Featured App right, switching off reserve attestation,
+-- a new market) is only proposed here and the operator executes it (`Proposal_ExecuteTrusted`,
+-- `MarketListing_Execute`); protocol income is executed by treasury.
+--
+-- Rules from DecMan "Writing Custom Daml Templates", applied here:
+-- - signatory is the proposer only, the governance party is an observer;
+-- - preconditions are `ensure` clauses: a bad proposal fails at creation, before any votes;
+-- - every contract id the proposer passes is checked at execution against fields the members
+--   confirmed (operator, council membership, rotation contents, treasury): the proposer cannot point
+--   the action at another operator's council or another rotation;
+-- - the description is built from the fields, the proposer's note is only an addition: it is the
+--   permanent record in `GovernanceExecutionResult`;
+-- - the governance party sees the config, the council and proposals, never accounts (the pool and the
+--   accounts have no governors among their stakeholders), because every member node sees what it sees;
+-- - a new semantics is a new package version: `executeImpl` of a confirmed action never changes.
+module Lending.DecMan where
+
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (isNone, isSome)
+import DA.Text (intercalate)
+import DA.Time (RelTime, addRelTime, days, seconds)
+import Governance.Action
+
+import Lending.Config
+import Lending.Governance
+import Lending.Pool (require)
+import Lending.Types
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+
+-- | The longest a lending proposal created by an action waits for the operator or treasury.
+maxProposalTtl : RelTime
+maxProposalTtl = days 30
+
+validTtl : RelTime -> Bool
+validTtl t = t >= seconds 60 && t <= maxProposalTtl
+
+-- | The council this governance party runs alone: the operator the members confirmed, the decentralized
+-- party as the only member, threshold 1.
+checkCouncil : Party -> Party -> ContractId GovernanceCouncil -> Update GovernanceCouncil
+checkCouncil governanceParty operator councilCid = do
+  council <- fetch councilCid
+  require "council belongs to another operator" (council.operator == operator)
+  require "council must have the decentralized party as its only member"
+    (council.members == [governanceParty] && council.threshold == 1)
+  pure council
+
+checkConfig : Party -> Party -> ContractId ProtocolConfig -> Update ProtocolConfig
+checkConfig governanceParty operator configCid = do
+  config <- fetch configCid
+  require "config belongs to another operator" (config.roles.operator == operator)
+  require "config is not governed by the decentralized party" (config.governors == [governanceParty])
+  pure config
+
+-- | A change that `Proposal_Execute` refuses and the operator executes (`Proposal_ExecuteTrusted`).
+needsOperator : ProtocolConfig -> Optional TransferFactories -> Optional FeaturedRightChange -> Optional Roles -> Map MarketId MarketParams -> Bool
+needsOperator config factories featured roles markets =
+  optional False (/= config.transferFactories) factories
+    || setsFeaturedRight featured
+    || optional False (/= config.roles) roles
+    || disablesAttestation config.marketParams markets
+
+noteText : Text -> Text
+noteText "" = ""
+noteText n = "; proposer's note: " <> n
+
+-- | The parameters a change is computed from (0.2.5): for a readable diff in DecMan.
+data ParamsBase = ParamsBase with
+    params : ProtocolParams
+    marketParams : Map MarketId MarketParams
+  deriving (Eq, Show)
+
+-- | "minLoan 250.0 -> 100.0; CBTC borrowCollateralFactor 0.5 -> 0.45": only what changes.
+paramsDiff : ParamsBase -> ProtocolParams -> Map MarketId MarketParams -> Text
+paramsDiff b p m =
+  let field name f old new = [ name <> " " <> show (f old) <> " -> " <> show (f new) | f old /= f new ]
+      proto = concat
+        [ field "totalBorrowCap" (.totalBorrowCap) b.params p
+        , field "maxDebtPerUser" (.maxDebtPerUser) b.params p
+        , field "minLoan" (.minLoan) b.params p
+        , field "liquidationRiskWarning" (.liquidationRiskWarning) b.params p
+        , field "maxPriceAgeSeconds" (.maxPriceAgeSeconds) b.params p
+        , field "maxSourceDeviation" (.maxSourceDeviation) b.params p
+        , field "maxLiquidationSourceDeviation" (.maxLiquidationSourceDeviation) b.params p
+        , field "maxDebtDepeg" (.maxDebtDepeg) b.params p
+        , field "maxClockSkewSeconds" (.maxClockSkewSeconds) b.params p
+        , field "storeFrontPriceFactor" (.storeFrontPriceFactor) b.params p
+        , field "targetReserves" (.targetReserves) b.params p
+        , field "rateModel.baseRate" (.rateModel.baseRate) b.params p
+        , field "rateModel.slope1" (.rateModel.slope1) b.params p
+        , field "rateModel.slope2" (.rateModel.slope2) b.params p
+        , field "rateModel.optimalUtilization" (.rateModel.optimalUtilization) b.params p
+        , field "rateModel.maxUtilization" (.rateModel.maxUtilization) b.params p
+        , field "rateModel.reserveFactor" (.rateModel.reserveFactor) b.params p
+        ]
+      market (k, new) = case Map.lookup k b.marketParams of
+        None -> [k <> " listed"]
+        Some old -> map ((k <> " ") <>) $ concat
+          [ field "borrowCollateralFactor" (.borrowCollateralFactor) old new
+          , field "liquidateCollateralFactor" (.liquidateCollateralFactor) old new
+          , field "liquidationFactor" (.liquidationFactor) old new
+          , field "supplyCap" (.supplyCap) old new
+          , field "minCollateralAmount" (.minCollateralAmount) old new
+          , field "requiresReserveAttestation" (.requiresReserveAttestation) old new
+          , field "minReserveCoverage" (.minReserveCoverage) old new
+          , field "maxAttestationAgeSeconds" (.maxAttestationAgeSeconds) old new
+          ]
+      removed = [ k <> " removed" | k <- Map.keys b.marketParams, not (Map.member k m) ]
+      changes = proto <> concatMap market (Map.toList m) <> removed
+  in if null changes then "no parameter change" else intercalate "; " changes
+
+-- Parameters, factories, roles, Featured App right ----------------------------------------
+
+template LendingParamsAction
+  with
+    governanceParty : Party
+    proposer : Party
+    operator : Party
+    councilCid : ContractId GovernanceCouncil
+    configCid : ContractId ProtocolConfig
+      -- ^ config the change is computed against: a change of the config in between fails the execution
+    proposalId : Text
+    newParams : ProtocolParams
+    newMarketParams : Map MarketId MarketParams
+    newTransferFactories : Optional TransferFactories
+    featuredAppRightChange : Optional FeaturedRightChange
+    newRoles : Optional Roles
+    proposalTtl : RelTime
+      -- ^ how long the lending proposal waits for the operator, if the change needs the operator
+    note : Text
+    base : Optional ParamsBase
+      -- ^ 0.2.5 (review 03.10, item 25): the parameters the change was computed from. The members
+      --   then see a short diff ("CBTC liquidateCollateralFactor 0.65 -> 0.6") instead of the whole
+      --   config, and the execution checks the base is still the config's
+  where
+    signatory proposer
+    observer governanceParty
+    ensure proposalId /= "" && validTtl proposalTtl && governanceParty /= operator
+      && null (validateProtocolParams newParams)
+      && all (null . validateMarketParams) (Map.values newMarketParams)
+      && optional True (\r -> r.operator == operator && null (validateRoles r)) newRoles
+
+    interface instance GovernableAction for LendingParamsAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingParams"
+        description = "Lending " <> proposalId <> " (operator " <> show operator <> "): "
+          <> optional
+               ("params " <> show newParams <> "; markets " <> show newMarketParams)
+               (\b -> paramsDiff b newParams newMarketParams)
+               base
+          <> optional "" (\f -> "; transfer factories " <> show f) newTransferFactories
+          <> optional "" (\c -> "; featured app right " <> show c) featuredAppRightChange
+          <> optional "" (\r -> "; roles " <> show r) newRoles
+          <> noteText note
+      executeImpl = do
+        _ <- checkCouncil governanceParty operator councilCid
+        config <- checkConfig governanceParty operator configCid
+        -- the diff the members confirmed must be the change against the config being executed
+        forA_ base \b -> unless (b.params == config.params && b.marketParams == config.marketParams)
+          (abort "the confirmed change was computed from another config: propose again")
+        now <- getTime
+        proposalCid <- exercise councilCid Council_Propose with
+          proposer = governanceParty; proposalId
+          description = "DecMan " <> proposalId <> noteText note
+          configCid; newParams; newMarketParams; newTransferFactories
+          expiresAt = addRelTime now proposalTtl
+          featuredAppRightChange; newRoles
+        -- Threshold-only change: applied now. Otherwise the proposal waits for the operator, or, for a
+        -- lower liquidation factor, 2 days (risk 9; LendingExecuteParamsAction then applies it).
+        if needsOperator config newTransferFactories featuredAppRightChange newRoles newMarketParams
+            || lowersLiquidationFactor config.marketParams newMarketParams
+          then pure ()
+          else do
+            _ <- exercise proposalCid Proposal_Execute with executor = governanceParty; configCid
+            pure ()
+
+-- | Apply a threshold-only lending proposal of the decentralized party once it can be executed:
+-- a lower liquidation factor after its 2-day delay (risk 9).
+template LendingExecuteParamsAction
+  with
+    governanceParty : Party
+    proposer : Party
+    operator : Party
+    proposalCid : ContractId ParameterChangeProposal
+    configCid : ContractId ProtocolConfig
+    proposalId : Text
+      -- ^ the proposal the members confirm: another proposal behind the contract id is rejected
+    note : Text
+  where
+    signatory proposer
+    observer governanceParty
+    ensure proposalId /= "" && governanceParty /= operator
+
+    interface instance GovernableAction for LendingExecuteParamsAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingExecuteParams"
+        description = "Lending " <> proposalId <> " (operator " <> show operator <> "): apply the proposal"
+          <> noteText note
+      executeImpl = do
+        proposal <- fetch proposalCid
+        require "proposal of another operator" (proposal.operator == operator)
+        require "proposal is not the confirmed one" (proposal.proposalId == proposalId)
+        require "proposal is not the decentralized party's" (proposal.proposer == governanceParty)
+        _ <- checkConfig governanceParty operator configCid
+        _ <- exercise proposalCid Proposal_Execute with executor = governanceParty; configCid
+        pure ()
+
+-- New collateral market -------------------------------------------------------------------
+
+template LendingMarketAction
+  with
+    governanceParty : Party
+    proposer : Party
+    operator : Party
+    councilCid : ContractId GovernanceCouncil
+    proposalId : Text
+    marketId : MarketId
+    market : MarketParams
+    factory : ContractId TransferFactory
+    proposalTtl : RelTime
+    note : Text
+  where
+    signatory proposer
+    observer governanceParty
+    ensure proposalId /= "" && validTtl proposalTtl && governanceParty /= operator
+      && validMarketId marketId && null (validateMarketParams market)
+
+    interface instance GovernableAction for LendingMarketAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingMarketListing"
+        description = "Lending " <> proposalId <> " (operator " <> show operator <> "): list market "
+          <> marketId <> " " <> show market <> ", factory " <> show factory <> noteText note
+      executeImpl = do
+        _ <- checkCouncil governanceParty operator councilCid
+        now <- getTime
+        -- The operator executes it (MarketListing_Execute): a new instrument is the trusted path
+        _ <- exercise councilCid Council_ProposeMarket with
+          proposer = governanceParty; proposalId; marketId; market; factory
+          expiresAt = addRelTime now proposalTtl
+        pure ()
+
+-- Market removal ----------------------------------------------------------------------------
+
+template LendingDelistAction
+  with
+    governanceParty : Party
+    proposer : Party
+    operator : Party
+    councilCid : ContractId GovernanceCouncil
+    proposalId : Text
+    marketId : MarketId
+    proposalTtl : RelTime
+    note : Text
+  where
+    signatory proposer
+    observer governanceParty
+    ensure proposalId /= "" && validTtl proposalTtl && governanceParty /= operator && validMarketId marketId
+
+    interface instance GovernableAction for LendingDelistAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingMarketDelisting"
+        description = "Lending " <> proposalId <> " (operator " <> show operator <> "): remove market "
+          <> marketId <> " once users have withdrawn its collateral" <> noteText note
+      executeImpl = do
+        _ <- checkCouncil governanceParty operator councilCid
+        now <- getTime
+        -- The operator executes it (Delisting_Execute) once the market holds no user collateral
+        _ <- exercise councilCid Council_ProposeDelisting with
+          proposer = governanceParty; proposalId; marketId
+          expiresAt = addRelTime now proposalTtl
+        pure ()
+
+-- Protocol income -------------------------------------------------------------------------
+
+template LendingIncomeAction
+  with
+    governanceParty : Party
+    proposer : Party
+    operator : Party
+    councilCid : ContractId GovernanceCouncil
+    configCid : ContractId ProtocolConfig
+    proposalId : Text
+    treasury : Party
+    reservesAmount : Decimal
+    proposalTtl : RelTime
+    note : Text
+  where
+    signatory proposer
+    observer governanceParty
+    ensure proposalId /= "" && validTtl proposalTtl && governanceParty /= operator
+      && reservesAmount > 0.0
+
+    interface instance GovernableAction for LendingIncomeAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingIncome"
+        description = "Lending " <> proposalId <> " (operator " <> show operator <> "): pay to treasury "
+          <> show treasury <> " reserves " <> show reservesAmount <> " USDCx"
+          <> noteText note
+      executeImpl = do
+        _ <- checkCouncil governanceParty operator councilCid
+        config <- checkConfig governanceParty operator configCid
+        require "treasury is not the protocol treasury" (treasury == config.roles.treasury)
+        now <- getTime
+        -- Treasury executes it (IncomeProposal_Execute): the transfer needs the receiver's signature
+        _ <- exercise councilCid Council_ProposeIncome with
+          proposer = governanceParty; proposalId; treasury; reservesAmount
+          expiresAt = addRelTime now proposalTtl
+        pure ()
+
+-- Council rotation: forming the first council, moving to or from the decentralized party ---------
+-- To the decentralized party: the current council proposes and approves as before, the party joins
+-- here (RotationJoin), the operator or a council member executes. From it: the party proposes here
+-- (RotationPropose, its approval is the whole threshold), the new members join, then execution.
+
+data RotationStep
+  = RotationJoin
+      -- ^ the decentralized party signs as a new member
+  | RotationPropose with
+      rotationId : Text
+      proposalTtl : RelTime
+      -- ^ the decentralized party proposes a new council (it is the current council)
+  deriving (Eq, Show)
+
+template LendingRotationAction
+  with
+    governanceParty : Party
+    proposer : Party
+    operator : Party
+    step : RotationStep
+    rotationCid : Optional (ContractId CouncilRotation)
+      -- ^ Join: the rotation; Propose: None
+    councilCid : Optional (ContractId GovernanceCouncil)
+      -- ^ Propose: the current council; Join: None
+    newMembers : [Party]
+    newThreshold : Int
+      -- ^ the rotation contents the members confirm; a rotation with other contents is rejected
+    note : Text
+  where
+    signatory proposer
+    observer governanceParty
+    ensure governanceParty /= operator && operator `notElem` newMembers
+      && newThreshold >= 1 && newThreshold <= length newMembers
+      && (case step of
+            RotationPropose rotationId proposalTtl ->
+              rotationId /= "" && validTtl proposalTtl && isSome councilCid && isNone rotationCid
+            RotationJoin -> isSome rotationCid && isNone councilCid && governanceParty `elem` newMembers)
+
+    interface instance GovernableAction for LendingRotationAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingCouncilRotation"
+        description = "Lending council (operator " <> show operator <> "): " <> show step
+          <> " to members " <> show newMembers <> ", threshold " <> show newThreshold <> noteText note
+      executeImpl = case (step, rotationCid, councilCid) of
+        (RotationPropose rotationId proposalTtl, None, Some cid) -> do
+          _ <- checkCouncil governanceParty operator cid
+          now <- getTime
+          _ <- exercise cid Council_ProposeRotation with
+            proposer = governanceParty; rotationId; newMembers; newThreshold
+            expiresAt = addRelTime now proposalTtl
+          pure ()
+        (_, Some cid, None) -> do
+          rotation <- fetch cid
+          require "rotation belongs to another operator" (rotation.operator == operator)
+          require "rotation proposes other members or threshold"
+            (rotation.newMembers == newMembers && rotation.newThreshold == newThreshold)
+          _ <- exercise cid Rotation_Join with joiner = governanceParty
+          pure ()
+        _ -> abort "rotation step and contract ids do not match"
+
+-- Withdrawing a proposal the decentralized party created ------------------------------------
+
+data LendingProposalRef
+  = ParamsProposal (ContractId ParameterChangeProposal)
+  | MarketProposal (ContractId MarketListingProposal)
+  | IncomeProposalRef (ContractId IncomeProposal)
+  | RotationProposal (ContractId CouncilRotation)
+  | DelistingProposal (ContractId MarketDelistingProposal)
+  deriving (Eq, Show)
+
+-- | Withdraw a lending proposal that waits for the operator or treasury, when the members changed their
+-- mind. Only proposals authored by the decentralized party: `*_Withdraw` checks the author.
+template LendingWithdrawAction
+  with
+    governanceParty : Party
+    proposer : Party
+    target : LendingProposalRef
+    note : Text
+  where
+    signatory proposer
+    observer governanceParty
+
+    interface instance GovernableAction for LendingWithdrawAction where
+      view = GovernableActionView with
+        governanceParty; proposer
+        actionLabel = "LendingWithdrawProposal"
+        description = "Withdraw lending proposal " <> show target <> noteText note
+      executeImpl = case target of
+        ParamsProposal cid -> exercise cid Proposal_Withdraw with actor = governanceParty
+        MarketProposal cid -> exercise cid MarketListing_Withdraw with actor = governanceParty
+        IncomeProposalRef cid -> exercise cid IncomeProposal_Withdraw with actor = governanceParty
+        RotationProposal cid -> exercise cid Rotation_Withdraw with actor = governanceParty
+        DelistingProposal cid -> exercise cid Delisting_Withdraw with actor = governanceParty

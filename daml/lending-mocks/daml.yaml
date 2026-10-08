@@ -1,0 +1,11 @@
+sdk-version: 3.5.12
+name: lending-mocks
+source: daml
+version: 0.3.0
+# Mocks for sandbox and DevNet: a test Featured App right. Without daml-script,
+# so the DAR can be uploaded to a real node.
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - ../vendor/splice-api-featured-app-v1-1.0.0.dar

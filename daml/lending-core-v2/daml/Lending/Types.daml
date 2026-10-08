@@ -1,0 +1,255 @@
+-- | Protocol parameters and state, Compound V3 model (docs/requirements/compound-v3-migration):
+-- one USDCx balance per account (positive: supply, negative: debt), backed by all of its
+-- collateral; an undercollateralized account is absorbed by the protocol, which then sells the collateral.
+module Lending.Types where
+
+import DA.List (unique)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Lending.Math
+
+-- | Collateral asset identifier: "CC" or "CBTC".
+type MarketId = Text
+
+-- | Protocol roles (ADR-001, D6). Each role is a separate party.
+data Roles = Roles
+  with
+    operator : Party
+      -- ^ holds the assets, signs the pool and the accounts, absorbs accounts
+    oracle : Party
+      -- ^ publishes prices and reserve attestations
+    guardian : Party
+      -- ^ sets and lifts pauses
+    treasury : Party
+      -- ^ adds reserves and receives withdrawn reserves
+    backstop : Party
+      -- ^ the protocol's reserve buyer of absorbed collateral
+    liquidators : [Party]
+      -- ^ approved buyers of absorbed collateral
+  deriving (Eq, Show)
+
+-- | Kink model of the borrow rate (§4). The supply rate is ours: borrow rate × U × (1 − reserveFactor).
+data RateModel = RateModel
+  with
+    baseRate : N
+    slope1 : N
+      -- ^ rate increase from 0 to the optimum
+    slope2 : N
+      -- ^ rate increase from the optimum to 100%
+    optimalUtilization : N
+    maxUtilization : N
+      -- ^ launch fuse (decision 3): a borrow that pushes utilization above this is rejected
+    reserveFactor : N
+      -- ^ share of interest kept by the protocol
+  deriving (Eq, Show)
+
+-- | Pool parameters (§5).
+data ProtocolParams = ProtocolParams
+  with
+    debtInstrument : InstrumentId
+      -- ^ USDCx, the only borrowable asset
+    rateModel : RateModel
+    totalBorrowCap : N
+      -- ^ pool debt after a borrow
+    maxDebtPerUser : N
+      -- ^ account debt after a borrow
+    minLoan : N
+      -- ^ smallest debt an account may have after a borrow (baseBorrowMin)
+    liquidationRiskWarning : N
+      -- ^ debt / liquidation point above which the UI warns; display only
+    maxPriceAgeSeconds : N
+    maxSourceDeviation : N
+      -- ^ source deviation for borrowing and collateral withdrawal
+    maxLiquidationSourceDeviation : N
+      -- ^ source deviation for absorb and collateral sale: wider, they reduce risk
+    maxDebtDepeg : N
+      -- ^ allowed deviation of the USDCx price from 1 for a borrow
+    maxClockSkewSeconds : N
+      -- ^ a quote further in the future than this is an oracle error
+    storeFrontPriceFactor : N
+      -- ^ share of the liquidation penalty given to the buyer as a discount
+    targetReserves : N
+      -- ^ absorbed collateral is for sale while reserves are below this
+  deriving (Eq, Show)
+
+-- | Collateral asset parameters (AssetList.sol).
+data MarketParams = MarketParams
+  with
+    collateralInstrument : InstrumentId
+    borrowCollateralFactor : N
+      -- ^ share of the collateral value that can be borrowed
+    liquidateCollateralFactor : N
+      -- ^ an account whose debt exceeds this share of the collateral value is absorbed
+    liquidationFactor : N
+      -- ^ share of the collateral value credited to the account on absorb; penalty = 1 − this
+    supplyCap : N
+      -- ^ user collateral of the asset, in asset units
+    minCollateralAmount : N
+      -- ^ smallest collateral deposit, in asset units
+    requiresReserveAttestation : Bool
+      -- ^ CBTC: without a fresh attestation the asset adds nothing to the borrow capacity
+    minReserveCoverage : N
+    maxAttestationAgeSeconds : N
+  deriving (Eq, Show)
+
+-- | Collateral asset state. Parameters live in ProtocolConfig.
+data Market = Market
+  with
+    totalCollateral : N
+      -- ^ user collateral, in asset units
+    protocolCollateral : N
+      -- ^ absorbed collateral the protocol holds for sale
+    protocolCollateralBasis : N
+      -- ^ USDCx credited to accounts for `protocolCollateral`: its book value (risk 3)
+  deriving (Eq, Show)
+
+-- | USDCx pool state, Compound's totals. Reserves are not stored: cash + debt − supply.
+data PoolState = PoolState
+  with
+    totalSupplyPrincipal : N
+      -- ^ sum of positive account principals (totalSupplyBase)
+    totalBorrowPrincipal : N
+      -- ^ sum of the magnitudes of negative account principals (totalBorrowBase)
+    supplyIndex : N
+    borrowIndex : N
+    cash : N
+      -- ^ USDCx of the pool on the operator's balance, reserves included
+    lastUpdate : Time
+  deriving (Eq, Show)
+
+-- | Pause flags (K7). Supply of USDCx and of collateral is never paused (§11).
+data PauseFlags = PauseFlags
+  with
+    borrowPaused : Bool
+    collateralWithdrawPaused : Bool
+    supplyWithdrawPaused : Bool
+      -- ^ withdrawal of USDCx deposits
+    absorbPaused : Bool
+    buyPaused : Bool
+  deriving (Eq, Show)
+
+noPause : PauseFlags
+noPause = PauseFlags with
+  borrowPaused = False
+  collateralWithdrawPaused = False
+  supplyWithdrawPaused = False
+  absorbPaused = False
+  buyPaused = False
+
+-- | Default parameters: spec and "Параметры для нового деплоя".
+defaultRateModel : RateModel
+defaultRateModel = RateModel with
+  baseRate = 0.02
+  slope1 = 0.08
+  slope2 = 0.6
+  optimalUtilization = 0.65
+  maxUtilization = 0.8
+  reserveFactor = 0.2
+
+defaultProtocolParams : InstrumentId -> ProtocolParams
+defaultProtocolParams debtInstrument = ProtocolParams with
+  debtInstrument
+  rateModel = defaultRateModel
+  totalBorrowCap = 50000.0
+  maxDebtPerUser = 5000.0
+  minLoan = 250.0
+  liquidationRiskWarning = 0.71
+  maxPriceAgeSeconds = 300.0
+  maxSourceDeviation = 0.03
+  maxLiquidationSourceDeviation = 0.15
+  maxDebtDepeg = 0.02
+  maxClockSkewSeconds = 60.0
+  storeFrontPriceFactor = 0.8
+  targetReserves = 50000.0
+
+-- | Real assets (TestNet, MainNet): the same parameters; starting reserves are added by treasury.
+prodProtocolParams : InstrumentId -> ProtocolParams
+prodProtocolParams = defaultProtocolParams
+
+ccMarketParams : InstrumentId -> MarketParams
+ccMarketParams collateralInstrument = MarketParams with
+  collateralInstrument
+  borrowCollateralFactor = 0.3
+  liquidateCollateralFactor = 0.45
+  liquidationFactor = 0.93
+  supplyCap = 400000.0
+  minCollateralAmount = 10.0
+  requiresReserveAttestation = False
+  minReserveCoverage = 1.0
+  maxAttestationAgeSeconds = 86400.0
+
+cbtcMarketParams : InstrumentId -> MarketParams
+cbtcMarketParams collateralInstrument = MarketParams with
+  collateralInstrument
+  borrowCollateralFactor = 0.5
+  liquidateCollateralFactor = 0.65
+  liquidationFactor = 0.95
+  supplyCap = 0.58
+  minCollateralAmount = 0.00001
+  requiresReserveAttestation = True
+  minReserveCoverage = 1.0
+  maxAttestationAgeSeconds = 86400.0
+
+newMarket : Market
+newMarket = Market with
+  totalCollateral = 0.0
+  protocolCollateral = 0.0
+  protocolCollateralBasis = 0.0
+
+-- | Parameter checks. Returns the list of violations.
+validateRateModel : RateModel -> [Text]
+validateRateModel m =
+  [ "baseRate must be >= 0" | m.baseRate < 0.0 ] <>
+  [ "slopes must be in [0, 5]" | m.slope1 < 0.0 || m.slope2 < 0.0 || m.baseRate + m.slope1 + m.slope2 > 5.0 ] <>
+  [ "optimalUtilization must be in (0, 1)" | m.optimalUtilization <= 0.0 || m.optimalUtilization >= 1.0 ] <>
+  [ "maxUtilization must be in (0, 1]" | m.maxUtilization <= 0.0 || m.maxUtilization > 1.0 ] <>
+  [ "reserveFactor must be in [0, 1)" | m.reserveFactor < 0.0 || m.reserveFactor >= 1.0 ]
+
+validateProtocolParams : ProtocolParams -> [Text]
+validateProtocolParams p =
+  validateRateModel p.rateModel <>
+  [ "caps must be > 0" | p.totalBorrowCap <= 0.0 || p.maxDebtPerUser <= 0.0 ] <>
+  [ "minLoan must be in [0, maxDebtPerUser]" | p.minLoan < 0.0 || p.minLoan > p.maxDebtPerUser ] <>
+  [ "liquidationRiskWarning must be in (0, 1)" | p.liquidationRiskWarning <= 0.0 || p.liquidationRiskWarning >= 1.0 ] <>
+  -- Audit D-10: caps so that the council threshold cannot switch off the oracle checks
+  [ "maxPriceAgeSeconds must be in (0, 900]" | p.maxPriceAgeSeconds <= 0.0 || p.maxPriceAgeSeconds > 900.0 ] <>
+  [ "maxSourceDeviation must be in (0, 1)" | p.maxSourceDeviation <= 0.0 || p.maxSourceDeviation >= 1.0 ] <>
+  [ "maxLiquidationSourceDeviation must be in [maxSourceDeviation, 1)"
+  | p.maxLiquidationSourceDeviation < p.maxSourceDeviation || p.maxLiquidationSourceDeviation >= 1.0 ] <>
+  [ "maxDebtDepeg must be in (0, 0.1]" | p.maxDebtDepeg <= 0.0 || p.maxDebtDepeg > 0.1 ] <>
+  [ "maxClockSkewSeconds must be in [0, 120]" | p.maxClockSkewSeconds < 0.0 || p.maxClockSkewSeconds > 120.0 ] <>
+  [ "storeFrontPriceFactor must be in [0, 1]" | p.storeFrontPriceFactor < 0.0 || p.storeFrontPriceFactor > 1.0 ] <>
+  [ "targetReserves must be >= 0" | p.targetReserves < 0.0 ]
+
+-- | AssetList.sol: borrow factor below the liquidation factor, which is at most 1; ours: the
+-- liquidation factor in (0, 1], caps positive.
+validateMarketParams : MarketParams -> [Text]
+validateMarketParams m =
+  [ "borrowCollateralFactor must be in [0, liquidateCollateralFactor)"
+  | m.borrowCollateralFactor < 0.0 || m.borrowCollateralFactor >= m.liquidateCollateralFactor ] <>
+  [ "liquidateCollateralFactor must be at most 1" | m.liquidateCollateralFactor > 1.0 ] <>
+  [ "liquidationFactor must be in (0, 1]" | m.liquidationFactor <= 0.0 || m.liquidationFactor > 1.0 ] <>
+  [ "supplyCap must be > 0" | m.supplyCap <= 0.0 ] <>
+  [ "minCollateralAmount must be in (0, supplyCap]" | m.minCollateralAmount <= 0.0 || m.minCollateralAmount > m.supplyCap ] <>
+  [ "minReserveCoverage must be >= 0" | m.minReserveCoverage < 0.0 ] <>
+  [ "maxAttestationAgeSeconds must be in (0, 604800]"
+  | m.maxAttestationAgeSeconds <= 0.0 || m.maxAttestationAgeSeconds > 604800.0 ]
+
+-- | Roles on different parties (rule 5, audit D-10): operator, oracle, guardian, treasury
+-- and backstop are pairwise distinct; liquidators are a non-empty list without duplicates and without these roles.
+validateRoles : Roles -> [Text]
+validateRoles r =
+  [ "operator, oracle, guardian, treasury and backstop must be distinct parties" | not (unique core) ] <>
+  [ "at least one liquidator required" | null r.liquidators ] <>
+  [ "liquidators must be unique" | not (unique r.liquidators) ] <>
+  [ "a liquidator cannot hold another role" | any (`elem` core) r.liquidators ]
+  where
+    core = [r.operator, r.oracle, r.guardian, r.treasury, r.backstop]
+
+-- | All role parties.
+roleParties : Roles -> [Party]
+roleParties r = [r.operator, r.oracle, r.guardian, r.treasury, r.backstop] <> r.liquidators
+
+-- | Approved buyers of absorbed collateral: liquidators and the backstop.
+buyers : Roles -> [Party]
+buyers r = r.backstop :: r.liquidators

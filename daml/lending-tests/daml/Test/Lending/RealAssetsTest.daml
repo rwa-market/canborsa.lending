@@ -1,0 +1,572 @@
+-- | Real assets (lending-core 0.6.0): deposit crediting by reason, withdrawal to a Canton
+-- party and a USDCx withdrawal request to Ethereum signed by the wallet.
+-- Signatures are computed with the same key as in EvmTest (address 0x2c75…5c23), expiry 00:20 UTC 1970.
+-- Parties are allocated by hint: their id in the message text does not change between runs.
+module Test.Lending.RealAssetsTest where
+
+import DA.Assert ((===))
+import DA.Foldable (forA_)
+import DA.Optional (fromSome)
+import DA.Set qualified as Set
+import DA.Text qualified as T
+import DA.TextMap qualified as TextMap
+import DA.Time (addRelTime, minutes, time)
+import DA.Date (Month (..), date)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as H
+import Splice.Api.Token.MetadataV1 (Metadata (..), emptyMetadata)
+import Splice.Api.Token.TransferInstructionV1
+import Splice.Testing.Tokens.TestTokenV1 (TokenRules (..), TokenTransferOffer (..))
+
+import Lending.Account
+import Lending.Evm hiding (balanceOf)
+import Lending.EvmDeposit
+import Lending.EvmRedeem
+import Lending.Pool
+import Lending.Token (TransferArgs (..))
+import Test.Lending.Env
+import Test.Lending.EvmTest
+
+-- Signatures ------------------------------------------------------------------------------
+
+ethTarget : Text
+ethTarget = "0x1111111111111111111111111111111111111111"
+
+otherAddress : Text
+otherAddress = "0x2222222222222222222222222222222222222222"
+
+-- | Signature of an action string with nonce 0: (string, r, s). Strings with parties are templates,
+-- `{R}` and `{C}` are replaced with the receiver's and custodian's ids.
+signed : [(Text, Text, Text)]
+signed =
+  [ ("Send 100.0 USDCx to {R}", "2a81adaaa43f7dbd0e2e7e57e29c3bd589655b1fa9821cecf81a9370a062aa6f", "2830bd5fa78550343bb12e11ee436913f03b0dba60fe74f0a34f2780ed153202")
+  , ("Send 5000.0 USDCx to {R}", "f1e65167b715742d81d1b390c768b5820b42f9d43598199195b9f2a673e8e0ac", "3c5860c405ffd02ee87fe7c768f51c114ad015ab1fa3eece16a0e6ba7f323f83")
+  , ("Send 10.0 XYZ to {R}", "99738e72d94b546c2fee64bb97a596facf3688daf4597935049af9cf15462ae9", "7c4f769ca604f93a91485237412d7508a8025d146419da16b2c0cbeea6556fc9")
+  , ("Send 100.0 USDCx to {C}", "a54cec844d503f562d7933f51e2c293d2ad4f37cebe66dc4bb4e2ab24deaa5d0", "51cb61354d1093e42ee6aad09c62566dac7f51324be143213bde0d48ba1becf0")
+  , ("Redeem 100.123456 USDCx to Ethereum " <> ethTarget, "55a52f563eaae290567727f7c7ad09e4d52d0c29edf5aded03b08ee04b22b362", "777340e6fe0232d64360e41a6011bc1d55e01b16c6ccf185d45f9e91858b7433")
+  , ("Redeem 100.1234567 USDCx to Ethereum " <> ethTarget, "16423b5bc8ca99497cd59b880ed3913e735358f13f9b11c671ff30cb5ccb13bf", "6241234a7bfd5f729ff34fa4475b8d5d9fbd999a97771169883b5e9a677166bc")
+  , ("Redeem 5000.0 USDCx to Ethereum " <> ethTarget, "46538c253b33d269d0e6e71e8bd4607a264bad946d34f3f168b60dca4d26378c", "3e3f27be1dc552b28e478d05339c3eb88d837151020e71375da641dca99ebe5b")
+  , ("Redeem 100.0 USDCx to Ethereum 0x1111111111111111111111111111111111111ABC", "d4267b786abcf72d244db25cc0275247068f660b75f89413fe02634ecb1a70f4", "48b96fc22c9228e6c0c61669cca5a5632ad02640c4694510055ed643d0a9c5eb")
+  ]
+
+data RaEnv = RaEnv with e : EvmEnv; receiver : Party
+
+setupRa : Script RaEnv
+setupRa = do
+  e <- setupEvm
+  receiver <- allocatePartyByHint (PartyIdHint "EReceiver")
+  receive e e.env.usdcx 1000.0
+  pure RaEnv with ..
+
+fill : RaEnv -> Text -> Text
+fill ra = T.replace "{R}" (partyToText ra.receiver) . T.replace "{C}" (partyToText ra.e.custody)
+
+-- | Signature of an action string (nonce 0) from the `signed` table.
+sigOf : RaEnv -> EvmAction -> EvmSignature
+sigOf ra action =
+  let line = actionLine "USDCx" action
+  in case [ (r, s) | (l, r, s) <- signed, fill ra l == line ] of
+      [(r, s)] -> EvmSignature with publicKey = testKey; r; s; nonce = 0; expiresAt = expiry
+      _ -> error ("no signature for line: " <> line)
+
+-- Commands ----------------------------------------------------------------------------------
+
+type WalletOpResult = (ContractId EvmWallet, Optional (ContractId TransferInstruction), Optional (ContractId RedeemRequest))
+
+walletOpCmd : RaEnv -> EvmAction -> EvmSignature -> Optional TransferArgs -> Script (Commands WalletOpResult)
+walletOpCmd ra action signature transfer = do
+  let env = ra.e.env
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (walletCid, _) <- walletOf ra.e
+  pure $ exerciseCmd poolCid Pool_EvmWalletExecute with
+    custody = ra.e.custody; configCid; walletCid; action; signature; transfer
+
+-- | Custodian transfer arguments for withdrawing an instrument.
+custodyArgs : RaEnv -> H.InstrumentId -> Script (Optional TransferArgs)
+custodyArgs ra i = Some <$> transferArgs ra.e.custody i
+
+walletOpAs : Party -> RaEnv -> EvmAction -> EvmSignature -> Optional TransferArgs -> Script (Either SubmitError WalletOpResult)
+walletOpAs submitter ra action signature transfer = do
+  cmd <- walletOpCmd ra action signature transfer
+  ds <- disclosures ra.e.env
+  trySubmit (actAs submitter <> readAs ra.e.custody <> discloseMany ds) cmd
+
+walletOp : RaEnv -> EvmAction -> EvmSignature -> Optional TransferArgs -> Script WalletOpResult
+walletOp ra action signature transfer =
+  walletOpAs ra.e.custody ra action signature transfer >>= either (\err -> abort (show err)) pure
+
+expectFail : Text -> Either SubmitError a -> Script ()
+expectFail expected r = case r of
+  Left err -> unless' (expected `T.isInfixOf` show err) ("expected '" <> expected <> "', got " <> show err)
+  Right _ -> abort ("expected failure: " <> expected)
+
+failWalletOp : RaEnv -> EvmAction -> EvmSignature -> Optional TransferArgs -> Text -> Script ()
+failWalletOp ra action signature transfer expected =
+  walletOpAs ra.e.custody ra action signature transfer >>= expectFail expected
+
+send100 : RaEnv -> EvmAction
+send100 ra = EvmTransferOut with instrumentId = ra.e.env.usdcx; amount = 100.0; receiver = ra.receiver
+
+redeem : Decimal -> EvmAction
+redeem amount = EvmRedeem with amount; ethAddress = ethTarget; requestId = "req-1"
+
+-- | Incoming transfer to the custodian with meta; the custodian has not accepted it yet.
+offerWithMeta : RaEnv -> H.InstrumentId -> Decimal -> Metadata -> Script (ContractId TransferInstruction)
+offerWithMeta ra instrumentId amount meta = do
+  now <- getTime
+  offerCid <- submit instrumentId.admin $ createCmd TokenTransferOffer with
+    transfer = Transfer with
+      sender = instrumentId.admin; receiver = ra.e.custody; amount; instrumentId
+      requestedAt = now; executeBefore = addRelTime now (minutes 60)
+      inputHoldingCids = []; meta
+  pure (toInterfaceContractId @TransferInstruction offerCid)
+
+reasonMeta : Text -> Metadata
+reasonMeta value = Metadata with values = TextMap.fromList [("splice.lfdecentralizedtrust.org/reason", value)]
+
+receiveAttributedAs : Party -> RaEnv -> ContractId TransferInstruction -> Script (Either SubmitError (ContractId EvmWallet))
+receiveAttributedAs submitter ra instructionCid = do
+  (walletCid, _) <- walletOf ra.e
+  trySubmit (actAs submitter <> readAs ra.e.custody) $ exerciseCmd walletCid EvmWallet_ReceiveAttributed with
+    instructionCid; extraArgs = noExtraArgs
+
+-- Signature string vector ---------------------------------------------------------------------
+
+test_realAssetsVector : Script ()
+test_realAssetsVector = do
+  let operator = fromSome (partyFromText "Operator::1220abcd")
+      receiver = fromSome (partyFromText "Receiver::1220ef01")
+      usdcx = H.InstrumentId with admin = operator; id = "USDCx"
+      send = EvmTransferOut with instrumentId = usdcx; amount = 25.5; receiver
+      out = EvmRedeem with amount = 12.345678; ethAddress = ethTarget; requestId = "r-1"
+  actionLine "USDCx" send === "Send 25.5 USDCx to Receiver::1220ef01"
+  actionLine "USDCx" out === ("Redeem 12.345678 USDCx to Ethereum " <> ethTarget)
+  evmMessage "canton:devnet" operator testAddress (actionLine "USDCx" send) 3 (time (date 2030 Jan 1) 0 0 0)
+    === "Canton Lending\nSend 25.5 USDCx to Receiver::1220ef01\nAccount: 0x2c7536e3605d9c16a7a3d7b1898e529396a65c23\nNetwork: canton:devnet\nOperator: Operator::1220abcd\nNonce: 3\nExpires: 2030-01-01T00:00:00Z"
+  evmDepositReason testAddress === "lending:evm:0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"
+
+-- | Message texts to sign (printed to the log; the `signed` table is computed by a script outside Daml).
+test_realAssetsMessages : Script ()
+test_realAssetsMessages = do
+  ra <- setupRa
+  evmMessage "canton:test" ra.e.env.operator testAddress (fill ra "Send 100.0 USDCx to {R}") 0 expiry
+    === "Canton Lending\nSend 100.0 USDCx to EReceiver\nAccount: 0x2c7536e3605d9c16a7a3d7b1898e529396a65c23\nNetwork: canton:test\nOperator: EOperator\nNonce: 0\nExpires: 1970-01-01T00:20:00Z"
+  -- each signature in the table is valid for its message
+  forA_ signed \(l, r, s) ->
+    checkEvmSignature testAddress (evmMessage "canton:test" ra.e.env.operator testAddress (fill ra l) 0 expiry)
+      (EvmSignature with publicKey = testKey; r; s; nonce = 0; expiresAt = expiry) === Right ()
+
+-- EvmWallet_ReceiveAttributed -----------------------------------------------------------------
+
+test_receiveAttributed : Script ()
+test_receiveAttributed = do
+  ra <- setupRa
+  let env = ra.e.env
+  -- correct reason: credited
+  ok <- offerWithMeta ra env.cbtc 0.5 (reasonMeta ("lending:evm:" <> testAddress))
+  receiveAttributedAs env.operator ra ok >>= expectFail "Authorization failure"
+  receiveAttributedAs env.alice ra ok >>= expectFail "Authorization failure"
+  receiveAttributedAs ra.e.custody ra ok >>= either (abort . show) (const (pure ()))
+  balance ra.e env.cbtc >>= (=== 0.5)
+  balanceOf ra.e.custody env.cbtc >>= (=== 0.5)
+  -- repeat of the same instruction: it is already accepted
+  receiveAttributedAs ra.e.custody ra ok >>= expectFail "Could not find contract"
+  -- without reason
+  none <- offerWithMeta ra env.cbtc 0.5 emptyMetadata
+  receiveAttributedAs ra.e.custody ra none >>= expectFail "no deposit reason"
+  -- another address, another prefix, address not in lower case
+  other <- offerWithMeta ra env.cbtc 0.5 (reasonMeta ("lending:evm:" <> otherAddress))
+  receiveAttributedAs ra.e.custody ra other >>= expectFail "deposit reason does not match this EVM wallet"
+  memo <- offerWithMeta ra env.cbtc 0.5 (reasonMeta testAddress)
+  receiveAttributedAs ra.e.custody ra memo >>= expectFail "deposit reason does not match this EVM wallet"
+  upper <- offerWithMeta ra env.cbtc 0.5 (reasonMeta "lending:evm:0x2C7536e3605d9c16a7a3d7b1898e529396a65c23")
+  receiveAttributedAs ra.e.custody ra upper >>= expectFail "deposit reason does not match this EVM wallet"
+  -- the rejections credited nothing
+  balance ra.e env.cbtc >>= (=== 0.5)
+
+test_receiveAttributedNotToCustody : Script ()
+test_receiveAttributedNotToCustody = do
+  ra <- setupRa
+  let env = ra.e.env
+  now <- getTime
+  offerCid <- submit env.cbtc.admin $ createCmd TokenTransferOffer with
+    transfer = Transfer with
+      sender = env.cbtc.admin; receiver = env.alice; amount = 1.0; instrumentId = env.cbtc
+      requestedAt = now; executeBefore = addRelTime now (minutes 60)
+      inputHoldingCids = []; meta = reasonMeta ("lending:evm:" <> testAddress)
+  -- the custodian cannot even read someone else's transfer
+  (walletCid, _) <- walletOf ra.e
+  r <- trySubmit (actAs ra.e.custody <> readAs env.alice) $ exerciseCmd walletCid EvmWallet_ReceiveAttributed with
+    instructionCid = toInterfaceContractId offerCid; extraArgs = noExtraArgs
+  expectFail "Authorization failure" r
+  -- the custodian sees its own outgoing transfer with this wallet's reason, but cannot credit it
+  args <- custodyArgs ra env.usdcx
+  (_, pending, _) <- walletOp ra (send100 ra) (sigOf ra (send100 ra)) args
+  receiveAttributedAs ra.e.custody ra (fromSome pending) >>= expectFail "transfer is not addressed to the custody party"
+  balance ra.e env.cbtc >>= (=== 0.0)
+  balance ra.e env.usdcx >>= (=== 900.0)
+
+-- EvmTransferOut ------------------------------------------------------------------------------
+
+test_transferOut : Script ()
+test_transferOut = do
+  ra <- setupRa
+  let env = ra.e.env
+  args <- custodyArgs ra env.usdcx
+  (_, pending, redeemCid) <- walletOp ra (send100 ra) (sigOf ra (send100 ra)) args
+  redeemCid === None
+  balance ra.e env.usdcx >>= (=== 900.0)
+  (_, w) <- walletOf ra.e
+  w.nonce === 1
+  -- the test registry is two-step: the transfer awaits the receiver, with the wallet's reason
+  let instructionCid = fromSome pending
+  Some iv <- queryInterfaceContractId @TransferInstruction ra.receiver instructionCid
+  iv.transfer.sender === ra.e.custody
+  iv.transfer.receiver === ra.receiver
+  iv.transfer.amount === 100.0
+  TextMap.lookup "splice.lfdecentralizedtrust.org/reason" iv.transfer.meta.values === Some ("lending:evm:" <> testAddress)
+  balanceOf ra.e.custody env.usdcx >>= (=== 900.0)
+  _ <- submit ra.receiver $ exerciseCmd instructionCid TransferInstruction_Accept with extraArgs = noExtraArgs
+  balanceOf ra.receiver env.usdcx >>= (=== 100.0)
+  -- repeat of the same signature
+  args <- custodyArgs ra env.usdcx
+  failWalletOp ra (send100 ra) (sigOf ra (send100 ra)) args "nonce is stale"
+
+test_transferOutRejects : Script ()
+test_transferOutRejects = do
+  ra <- setupRa
+  let env = ra.e.env
+      send = send100 ra
+      sig = sigOf ra send
+  args <- custodyArgs ra env.usdcx
+  -- amount or receiver differ from the signed ones
+  failWalletOp ra (send with amount = 200.0) sig args "does not match the operation"
+  failWalletOp ra (send with receiver = env.alice) sig args "does not match the operation"
+  -- more than the free balance
+  let big = send with amount = 5000.0
+  failWalletOp ra big (sigOf ra big) args "insufficient USDCx in the EVM wallet"
+  -- receiver is the custodian itself
+  let self = send with receiver = ra.e.custody
+  failWalletOp ra self (sigOf ra self) args "receiver must not be the custody party"
+  -- without the custodian's holdings
+  failWalletOp ra send sig None "transfer arguments required"
+  -- factory not from ProtocolConfig: same registry, a different rules contract
+  -- (disclosures before the second rules contract is created: Env expects one per registry)
+  ds <- disclosures env
+  fake <- submit env.usdcx.admin $ createCmd TokenRules with admin = env.usdcx.admin
+  let fakeArgs = fmap (\a -> a with factoryCid = toInterfaceContractId @TransferFactory fake) args
+  fakeCmd <- walletOpCmd ra send sig fakeArgs
+  trySubmit (actAs ra.e.custody <> discloseMany ds) fakeCmd >>= expectFail "untrusted transfer factory"
+  submit env.usdcx.admin $ archiveCmd fake
+  -- instrument without a trusted factory: there is a balance, but it cannot be withdrawn
+  xyzAdmin <- allocatePartyByHint (PartyIdHint "EXyzRegistry")
+  let xyz = H.InstrumentId with admin = xyzAdmin; id = "XYZ"
+  _ <- submit xyzAdmin $ createCmd TokenRules with admin = xyzAdmin
+  receive ra.e xyz 10.0
+  let sendXyz = EvmTransferOut with instrumentId = xyz; amount = 10.0; receiver = ra.receiver
+  xyzArgs <- custodyArgs ra xyz
+  failWalletOp ra sendXyz (sigOf ra sendXyz) xyzArgs "no trusted transfer factory for instrument"
+  -- a regular Pool_EvmExecute does not execute a withdrawal
+  failEvm ra.e send sig True "goes through Pool_EvmWalletExecute"
+  -- the controller is only the custodian
+  walletOpAs env.operator ra send sig args >>= expectFail "Authorization failure"
+  walletOpAs env.alice ra send sig args >>= expectFail "Authorization failure"
+  -- expired signature
+  passTime (minutes 21)
+  failWalletOp ra send sig args "signature expired"
+  -- nothing went out
+  balance ra.e env.usdcx >>= (=== 1000.0)
+  balanceOf ra.e.custody env.usdcx >>= (=== 1000.0)
+  (_, w) <- walletOf ra.e
+  w.nonce === 0
+
+-- | Transfer not accepted: the custodian recalls it, the wallet balance is restored.
+test_reclaimTransferOut : Script ()
+test_reclaimTransferOut = do
+  ra <- setupRa
+  let env = ra.e.env
+  args <- custodyArgs ra env.usdcx
+  (_, pending, _) <- walletOp ra (send100 ra) (sigOf ra (send100 ra)) args
+  let instructionCid = fromSome pending
+  (walletCid, _) <- walletOf ra.e
+  let reclaim = exerciseCmd walletCid EvmWallet_ReclaimTransferOut with instructionCid; extraArgs = noExtraArgs
+  trySubmit (actAs env.operator <> readAs ra.e.custody) reclaim >>= expectFail "Authorization failure"
+  trySubmit (actAs ra.receiver <> readAs ra.e.custody) reclaim >>= expectFail "Authorization failure"
+  _ <- submit ra.e.custody reclaim
+  balance ra.e env.usdcx >>= (=== 1000.0)
+  balanceOf ra.e.custody env.usdcx >>= (=== 1000.0)
+  -- not a second time: the instruction no longer exists
+  (walletCid, _) <- walletOf ra.e
+  trySubmit ra.e.custody (exerciseCmd walletCid EvmWallet_ReclaimTransferOut with instructionCid; extraArgs = noExtraArgs)
+    >>= expectFail "Could not find contract"
+  -- an incoming transfer to the custodian is not "recalled" into the wallet
+  incoming <- offerWithMeta ra env.cbtc 1.0 (reasonMeta ("lending:evm:" <> testAddress))
+  trySubmit ra.e.custody (exerciseCmd walletCid EvmWallet_ReclaimTransferOut with instructionCid = incoming; extraArgs = noExtraArgs)
+    >>= expectFail "transfer was not sent by the custody party"
+
+-- | A withdrawal from one wallet is not returned to another.
+test_reclaimOtherWallet : Script ()
+test_reclaimOtherWallet = do
+  ra <- setupRa
+  let env = ra.e.env
+  otherWalletCid <- openOtherWallet ra
+  args <- custodyArgs ra env.usdcx
+  (_, pending, _) <- walletOp ra (send100 ra) (sigOf ra (send100 ra)) args
+  trySubmit ra.e.custody (exerciseCmd otherWalletCid EvmWallet_ReclaimTransferOut with
+      instructionCid = fromSome pending; extraArgs = noExtraArgs)
+    >>= expectFail "transfer was not sent from this EVM wallet"
+
+openOtherWallet : RaEnv -> Script (ContractId EvmWallet)
+openOtherWallet ra = do
+  [(directoryCid, _)] <- query @EvmDirectory ra.e.env.operator
+  (_, _, walletCid) <- submit ra.e.env.operator $ exerciseCmd directoryCid EvmDirectory_Open with address = otherAddress
+  pure walletCid
+
+-- EvmRedeem and RedeemRequest -------------------------------------------------------------------
+
+test_redeemComplete : Script ()
+test_redeemComplete = do
+  ra <- setupRa
+  let env = ra.e.env
+      action = redeem 100.123456
+  (_, pending, requestCid) <- walletOp ra action (sigOf ra action) None
+  pending === None
+  balance ra.e env.usdcx >>= (=== 899.876544)
+  -- holdings stay with the custodian until the burn in xReserve
+  balanceOf ra.e.custody env.usdcx >>= (=== 1000.0)
+  let cid = fromSome requestCid
+  Some req <- queryContractId ra.e.custody cid
+  req.operator === env.operator
+  req.custody === ra.e.custody
+  req.address === testAddress
+  req.instrumentId === env.usdcx
+  req.amount === 100.123456
+  req.ethAddress === ethTarget
+  req.requestId === "req-1"
+  (_, w) <- walletOf ra.e
+  w.nonce === 1
+  -- Complete: only the custodian and with a burn reference
+  let complete ref = exerciseCmd cid RedeemRequest_Complete with burnReference = ref
+  trySubmit (actAs env.operator <> readAs ra.e.custody) (complete "0xburn") >>= expectFail "Authorization failure"
+  trySubmit (actAs env.alice <> readAs ra.e.custody) (complete "0xburn") >>= expectFail "Authorization failure"
+  trySubmit ra.e.custody (complete "") >>= expectFail "burn reference required"
+  submit ra.e.custody (complete "0xburn")
+  queryContractId ra.e.custody cid >>= (=== None) . fmap (const ())
+  -- after Complete the balance is not returned
+  balance ra.e env.usdcx >>= (=== 899.876544)
+  (walletCid, _) <- walletOf ra.e
+  trySubmit ra.e.custody (exerciseCmd cid RedeemRequest_Refund with actor = ra.e.custody; walletCid; reason = "late")
+    >>= expectFail "Could not find contract"
+
+test_redeemRefund : Script ()
+test_redeemRefund = do
+  ra <- setupRa
+  let env = ra.e.env
+      action = redeem 100.123456
+  (_, _, requestCid) <- walletOp ra action (sigOf ra action) None
+  let cid = fromSome requestCid
+  (walletCid, _) <- walletOf ra.e
+  let refund actor reason = exerciseCmd cid RedeemRequest_Refund with actor; walletCid; reason
+  -- an outsider does not return it, even seeing the request
+  trySubmit (actAs env.alice <> readAs ra.e.custody) (refund env.alice "x") >>= expectFail "only the custody party or the operator"
+  -- actor is not the submitter
+  trySubmit (actAs env.alice <> readAs ra.e.custody) (refund ra.e.custody "x") >>= expectFail "Authorization failure"
+  trySubmit ra.e.custody (refund ra.e.custody "") >>= expectFail "refund reason required"
+  -- not to someone else's wallet
+  otherWalletCid <- openOtherWallet ra
+  trySubmit ra.e.custody (exerciseCmd cid RedeemRequest_Refund with actor = ra.e.custody; walletCid = otherWalletCid; reason = "x")
+    >>= expectFail "EVM wallet of another address"
+  _ <- submit ra.e.custody (refund ra.e.custody "burn rejected")
+  balance ra.e env.usdcx >>= (=== 1000.0)
+  (_, w) <- walletOf ra.e
+  w.nonce === 1
+  -- not a second time
+  (walletCid, _) <- walletOf ra.e
+  trySubmit ra.e.custody (exerciseCmd cid RedeemRequest_Refund with actor = ra.e.custody; walletCid; reason = "again")
+    >>= expectFail "Could not find contract"
+  balance ra.e env.usdcx >>= (=== 1000.0)
+
+test_redeemRefundByOperator : Script ()
+test_redeemRefundByOperator = do
+  ra <- setupRa
+  let env = ra.e.env
+      action = redeem 100.123456
+  (_, _, requestCid) <- walletOp ra action (sigOf ra action) None
+  (walletCid, _) <- walletOf ra.e
+  _ <- submit (actAs env.operator <> readAs ra.e.custody) $ exerciseCmd (fromSome requestCid) RedeemRequest_Refund with
+    actor = env.operator; walletCid; reason = "xreserve paused"
+  balance ra.e env.usdcx >>= (=== 1000.0)
+
+test_redeemRejects : Script ()
+test_redeemRejects = do
+  ra <- setupRa
+  let env = ra.e.env
+      ok = redeem 100.123456
+      sig = sigOf ra ok
+  -- more than 6 decimals: xReserve burns up to 6
+  let seven = redeem 100.1234567
+  failWalletOp ra seven (sigOf ra seven) None "at most 6 decimal places"
+  -- more than the free balance
+  let big = redeem 5000.0
+  failWalletOp ra big (sigOf ra big) None "insufficient USDCx in the EVM wallet"
+  -- Ethereum address not in lower case
+  let upper = EvmRedeem with amount = 100.0; ethAddress = "0x1111111111111111111111111111111111111ABC"; requestId = "req-1"
+  failWalletOp ra upper (sigOf ra upper) None "lowercase 0x Ethereum address"
+  -- empty request id, extra transfer arguments
+  failWalletOp ra (ok with requestId = "") sig None "request id required"
+  args <- custodyArgs ra env.usdcx
+  failWalletOp ra ok sig args "redeem takes no transfer arguments"
+  -- address or amount differ from the signed ones
+  failWalletOp ra (ok with ethAddress = otherAddress) sig None "does not match the operation"
+  failWalletOp ra (ok with amount = 100.12345) sig None "does not match the operation"
+  -- the controller is only the custodian
+  walletOpAs env.operator ra ok sig None >>= expectFail "Authorization failure"
+  walletOpAs env.alice ra ok sig None >>= expectFail "Authorization failure"
+  -- a regular Pool_EvmExecute does not create a request
+  failEvm ra.e ok sig True "goes through Pool_EvmWalletExecute"
+  -- nothing debited and no requests
+  balance ra.e env.usdcx >>= (=== 1000.0)
+  query @RedeemRequest ra.e.custody >>= (=== 0) . length
+  -- a valid signature passes, a replay does not
+  _ <- walletOp ra ok sig None
+  failWalletOp ra ok sig None "nonce is stale"
+  balance ra.e env.usdcx >>= (=== 899.876544)
+  -- expired signature
+  passTime (minutes 21)
+  failWalletOp ra ok (sig with nonce = 1) None "signature expired"
+  rs <- query @RedeemRequest ra.e.custody
+  length rs === 1
+
+-- EvmWallet_CreditDeposit (xReserve mint, CC with preapproval) -------------------------------
+
+depositTx : Text
+depositTx = "0x" <> T.implode (replicate 64 "a")
+
+-- | Registry of the custodian's credited deposits: created once by the operator and the custodian.
+setupDeposits : Script RaEnv
+setupDeposits = do
+  ra <- setupRa
+  _ <- submit (actAs [ra.e.env.operator, ra.e.custody]) $ createCmd DepositRegistry with
+    operator = ra.e.env.operator; custody = ra.e.custody; refs = Set.empty
+  pure ra
+
+registryOf : RaEnv -> Script (ContractId DepositRegistry, DepositRegistry)
+registryOf ra = do
+  rs <- query @DepositRegistry ra.e.custody
+  case rs of
+    [r] -> pure r
+    _ -> abort "expected exactly one DepositRegistry"
+
+-- | Holding at the custodian without a transfer: an xReserve mint or CC via preapproval.
+landAtCustody : RaEnv -> H.InstrumentId -> Decimal -> Script (ContractId H.Holding)
+landAtCustody ra instrumentId amount = do
+  before <- map fst <$> holdingsOf ra.e.custody instrumentId
+  mint ra.e.env instrumentId ra.e.custody amount
+  hs <- holdingsOf ra.e.custody instrumentId
+  case [ cid | (cid, _) <- hs, cid `notElem` before ] of
+    [cid] -> pure cid
+    _ -> abort "landed holding not found"
+
+type CreditResult = (ContractId EvmWallet, ContractId DepositRegistry, ContractId DepositClaim)
+
+creditAs : Party -> RaEnv -> [ContractId H.Holding] -> H.InstrumentId -> Decimal -> Text -> Optional (ContractId EvmWallet) -> Script (Either SubmitError CreditResult)
+creditAs submitter ra holdingCids instrumentId amount depositRef walletOverride = do
+  (configCid, _) <- currentConfig ra.e.env
+  (registryCid, _) <- registryOf ra
+  walletCid <- case walletOverride of
+    Some w -> pure w
+    None -> fst <$> walletOf ra.e
+  ds <- disclosures ra.e.env
+  trySubmit (actAs submitter <> readAs ra.e.custody <> discloseMany ds) $ exerciseCmd walletCid EvmWallet_CreditDeposit with
+    configCid; registryCid; holdingCids; instrumentId; amount; depositRef
+
+credit' : RaEnv -> [ContractId H.Holding] -> H.InstrumentId -> Decimal -> Text -> Script CreditResult
+credit' ra hs i amount ref = creditAs ra.e.custody ra hs i amount ref None >>= either (abort . show) pure
+
+-- | USDCx from xReserve: depositRef is the Ethereum transaction hash.
+test_creditDepositMint : Script ()
+test_creditDepositMint = do
+  ra <- setupDeposits
+  let env = ra.e.env
+  h <- landAtCustody ra env.usdcx 250.5
+  -- the controller is only the custodian
+  creditAs env.operator ra [h] env.usdcx 250.5 depositTx None >>= expectFail "Authorization failure"
+  creditAs env.alice ra [h] env.usdcx 250.5 depositTx None >>= expectFail "Authorization failure"
+  (_, _, claimCid) <- credit' ra [h] env.usdcx 250.5 depositTx
+  balance ra.e env.usdcx >>= (=== 1250.5)
+  Some claim <- queryContractId ra.e.custody claimCid
+  claim.address === testAddress
+  claim.depositRef === depositTx
+  claim.instrumentId === env.usdcx
+  claim.amount === 250.5
+  (_, registry) <- registryOf ra
+  registry.refs === Set.fromList [depositTx]
+  -- holdings are not spent: they stay with the custodian
+  balanceOf ra.e.custody env.usdcx >>= (=== 1250.5)
+  -- the same deposit a second time: neither to this wallet nor to another
+  h2 <- landAtCustody ra env.usdcx 250.5
+  creditAs ra.e.custody ra [h2] env.usdcx 250.5 depositTx None >>= expectFail "deposit already credited"
+  otherWalletCid <- openOtherWallet ra
+  creditAs ra.e.custody ra [h2] env.usdcx 250.5 depositTx (Some otherWalletCid) >>= expectFail "deposit already credited"
+  -- the same hash in a different case does not bypass the replay check
+  creditAs ra.e.custody ra [h2] env.usdcx 250.5 (T.replace "a" "A" depositTx) None >>= expectFail "an Ethereum hash must be lowercase"
+  balance ra.e env.usdcx >>= (=== 1250.5)
+
+-- | CC via TransferPreapproval: the holding is at the custodian right away, depositRef is "<updateId>:<eventId>".
+test_creditDepositPreapproved : Script ()
+test_creditDepositPreapproved = do
+  ra <- setupDeposits
+  let env = ra.e.env
+      ref = "1220abcdef:7"
+  h <- landAtCustody ra env.cc 500.0
+  _ <- credit' ra [h] env.cc 500.0 ref
+  balance ra.e env.cc >>= (=== 500.0)
+  creditAs ra.e.custody ra [h] env.cc 500.0 ref None >>= expectFail "deposit already credited"
+  -- another deposit with the same holdings: the contract only sees that they suffice
+  _ <- credit' ra [h] env.cc 200.0 "1220abcdef:8"
+  balance ra.e env.cc >>= (=== 700.0)
+  (_, registry) <- registryOf ra
+  registry.refs === Set.fromList [ref, "1220abcdef:8"]
+
+test_creditDepositRejects : Script ()
+test_creditDepositRejects = do
+  ra <- setupDeposits
+  let env = ra.e.env
+      ref = depositTx
+  h <- landAtCustody ra env.usdcx 100.0
+  -- holdings below the amount
+  creditAs ra.e.custody ra [h] env.usdcx 100.5 ref None >>= expectFail "holdings below the credited amount"
+  creditAs ra.e.custody ra [] env.usdcx 1.0 ref None >>= expectFail "holdings required"
+  creditAs ra.e.custody ra [h, h] env.usdcx 200.0 ref None >>= expectFail "duplicate holdings"
+  creditAs ra.e.custody ra [h] env.usdcx 0.0 ref None >>= expectFail "amount must be positive"
+  -- empty id, surrounding whitespace
+  creditAs ra.e.custody ra [h] env.usdcx 100.0 "" None >>= expectFail "deposit reference must be non-empty"
+  creditAs ra.e.custody ra [h] env.usdcx 100.0 " 1220ab:1" None >>= expectFail "deposit reference must be non-empty"
+  -- holdings of another instrument: the custodian's CBTC passed off as USDCx
+  receive ra.e env.cbtc 1.0
+  cbtcs <- holdingsOf ra.e.custody env.cbtc
+  creditAs ra.e.custody ra (map fst cbtcs) env.usdcx 1.0 ref None >>= expectFail "holding of another instrument"
+  -- instrument outside the profile: no trusted factory
+  xyzAdmin <- allocatePartyByHint (PartyIdHint "EXyzRegistry")
+  let xyz = H.InstrumentId with admin = xyzAdmin; id = "XYZ"
+  hx <- landAtCustody ra xyz 5.0
+  creditAs ra.e.custody ra [hx] xyz 5.0 ref None >>= expectFail "instrument has no trusted transfer factory"
+  -- another party's holding: an incoming transfer to the custodian, the owner is the registry
+  incoming <- offerWithMeta ra env.usdcx 100.0 emptyMetadata
+  creditAs ra.e.custody ra [coerceInterfaceContractId @H.Holding incoming] env.usdcx 100.0 ref None
+    >>= expectFail "holding owned by another party"
+  -- the custodian does not see Alice's holding: the ledger does not find the contract
+  aliceHs <- holdingsOf env.alice env.usdcx
+  creditAs ra.e.custody ra (map fst aliceHs) env.usdcx 100.0 ref None >>= expectFail "Could not find contract"
+  -- the custodian's locked holding: its outgoing transfer is pending
+  args <- custodyArgs ra env.usdcx
+  (_, pending, _) <- walletOp ra (send100 ra) (sigOf ra (send100 ra)) args
+  creditAs ra.e.custody ra [coerceInterfaceContractId @H.Holding (fromSome pending)] env.usdcx 100.0 ref None
+    >>= expectFail "holding is locked"
+  -- nothing credited (900 after withdrawing 100)
+  balance ra.e env.usdcx >>= (=== 900.0)
+  balance ra.e env.cbtc >>= (=== 1.0)
+  (_, registry) <- registryOf ra
+  registry.refs === Set.empty

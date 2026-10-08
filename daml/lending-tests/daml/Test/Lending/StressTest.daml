@@ -1,0 +1,99 @@
+-- | T2.3.1 stress scenario (spec §13) on the Compound V3 model: 20 accounts, CC −50%, BTC −30%.
+-- The operator absorbs every liquidatable account, the liquidator buys the stock; the report shows
+-- reserves before and after, and the test checks token conservation and that no debt is left
+-- without collateral.
+module Test.Lending.StressTest where
+
+import DA.Action (when)
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Lending.Math
+import Lending.Types
+import Test.Lending.Env
+
+data Row = Row with party : Party; marketId : MarketId; amount : Decimal; loan : Decimal
+  deriving (Eq, Show)
+
+test_stress : Script ()
+test_stress = stressNamed "stress-"
+
+-- | Run on a live ledger with a unique party prefix (dpm script).
+stressLive : Text -> Script ()
+stressLive prefix = stressNamed prefix
+
+stressNamed : Text -> Script ()
+stressNamed prefix = do
+  env <- setupNamed prefix
+  seedLiquidity env 60000.0
+  mint env env.usdcx env.liquidator 100000.0
+  -- 10 CC accounts of 25 000 CC ($5 000), 10 CBTC accounts of 0.05 CBTC ($5 000);
+  -- loans from 60% to 100% of the borrow capacity (CC 1 500, CBTC 2 500)
+  users <- forA [1 .. 20] \i -> allocateParty (prefix <> "User" <> show i)
+  rows <- forA (zip [0 .. 19] users) \(i, u) -> do
+    let cc = i < 10
+        marketId = if cc then "CC" else "CBTC"
+        amount = if cc then 25000.0 else 0.05
+        capacity = if cc then 1500.0 else 2500.0 : N
+        k = intToNumeric (i % 10) : N
+        loan = floorDecimal (capacity * (0.6 + 0.4 * k / 9.0))
+    mint env (marketInstrument env marketId) u amount
+    openAccount env u
+    run env u (depositCmd env u marketId amount)
+    run env u (borrowCmd env u loan)
+    pure Row with party = u; marketId; amount; loan
+  let everyone = users <> [env.alice, env.bob, env.carol, env.liquidator, env.backstop, env.operator, env.treasury]
+  totalsBefore <- tokenTotals env everyone
+  reservesBefore <- poolNetReserves env
+
+  -- Crash
+  setPrice env env.cc 0.1
+  setPrice env env.cbtc 70000.0
+  absorbed <- fmap concat $ forA rows \r -> do
+    debt <- negate <$> balanceFor env r.party
+    point <- liquidationPointOf env r.marketId (toN r.amount)
+    if debt > point then absorb env r.party >> pure [r] else pure []
+  absorbedReserves <- poolNetReserves env
+
+  -- The liquidator buys the whole stock at the discount, one market at a time
+  forA_ ["CC", "CBTC"] \marketId -> do
+    m <- marketOf env marketId
+    mp <- marketParamsFor env marketId
+    let price = if marketId == "CC" then 0.1 else 70000.0
+        discounted = price * (1.0 - 0.8 * (1.0 - mp.liquidationFactor))
+        pay = floorDecimal (m.protocolCollateral * discounted)
+    when (pay > 0.0) $ run env env.liquidator (buyCmd env env.liquidator marketId pay 0.0)
+
+  debug "party | market | collateral | loan | absorbed | balance after"
+  forA_ rows \r -> do
+    b <- balanceFor env r.party
+    c <- collateralFor env r.party r.marketId
+    debug (partyToText r.party <> " | " <> r.marketId <> " | " <> show r.amount <> " | " <> show r.loan
+      <> " | " <> show (r `elem` absorbed) <> " | " <> show b)
+    -- an account still in debt is not liquidatable; an absorbed one has a deposit, not a debt
+    when (b < 0.0) do
+      point <- liquidationPointOf env r.marketId c
+      assertMsg "account in debt is above water" (negate b <= point)
+    when (r `elem` absorbed) $ assertMsg "absorbed account keeps no debt" (b >= 0.0)
+  ccStock <- (.protocolCollateral) <$> marketOf env "CC"
+  cbtcStock <- (.protocolCollateral) <$> marketOf env "CBTC"
+  reservesAfter <- poolNetReserves env
+  debug ("absorbed " <> show (length absorbed) <> " of 20; net reserves " <> show reservesBefore
+    <> " → after absorb " <> show absorbedReserves <> " → after sale " <> show reservesAfter
+    <> "; stock left CC " <> show ccStock <> ", CBTC " <> show cbtcStock)
+  -- liquidation points after the crash: CC 25 000 × 0.1 × 0.45 = 1 125 (loans of k = 4..9),
+  -- CBTC 0.05 × 70 000 × 0.65 = 2 275 (k = 7..9)
+  assertMsg "6 CC and 3 CBTC accounts absorbed" (length absorbed == 9)
+  assertMsg "absorb does not move net reserves down" (absorbedReserves >= reservesBefore)
+  assertMsg "no bad debt: the sale ends with net reserves at least as before" (reservesAfter >= reservesBefore)
+  totalsAfter <- tokenTotals env everyone
+  assertMsg "tokens conserved" (totalsBefore == totalsAfter)
+
+liquidationPointOf : Env -> MarketId -> N -> Script N
+liquidationPointOf env marketId amount = do
+  mp <- marketParamsFor env marketId
+  let price = if marketId == "CC" then 0.1 else 70000.0
+  pure (amount * price * mp.liquidateCollateralFactor)
+
+tokenTotals : Env -> [Party] -> Script [Decimal]
+tokenTotals env parties = forA [env.usdcx, env.cc, env.cbtc] \i -> sum <$> forA parties (`balanceOf` i)

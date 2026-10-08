@@ -1,0 +1,240 @@
+-- | Account under an EVM wallet (0.5.0, ADR-004): the contract verifies the EIP-191 signature.
+-- Signatures are precomputed with the key from the web3 docs (address 0x2c75…5c23) over the text of
+-- packages/shared/src/evm.ts: operator "EOperator", network canton:test, expiry 00:20 UTC 1970.
+-- Parties are allocated by hint: their id in the message text does not change between runs.
+module Test.Lending.EvmTest where
+
+import DA.Assert ((===))
+import DA.Map qualified as Map
+import DA.Optional (fromSome)
+import DA.Set qualified as Set
+import DA.Text qualified as T
+import DA.Time (addRelTime, minutes, time)
+import DA.Date (Month (..), date)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as H
+import Splice.Api.Token.MetadataV1 (emptyMetadata)
+import Splice.Api.Token.TransferInstructionV1 (Transfer (..), TransferInstruction)
+import Splice.Testing.Tokens.TestTokenV1 (TokenTransferOffer (..))
+
+import Lending.Account
+import Lending.Evm hiding (balanceOf)
+import Lending.Evm qualified as Evm
+import Lending.Pool
+import Test.Lending.Env
+
+testAddress : Text
+testAddress = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"
+
+testKey : Text
+testKey = "4e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e47fd35c4215d1edf53e6f83de344615ce719bdb0fd878f6ed76f06dd277956de"
+
+expiry : Time
+expiry = time (date 1970 Jan 1) 0 20 0
+
+-- | (nonce, r, s) of the end-to-end scenario steps: eth_keys over the evmMessage texts with the web3
+-- docs key, s in the lower half.
+signatures : [(Int, Text, Text)]
+signatures =
+  [ (0, "ca74c0654d056342b4737263f30e4741d20ecff3fca48d39f94f0107e671fb59", "5cb29447e8e6e939c4823d5868660ff9353bdd056fad0c1717c1a379890351a6")
+  , (1, "8726a71a8302751d2aee865a0d6c7f48484588921502f24285ee35e46e07b31a", "6e729a3be535aa6ce4aa99c61f5c7455db54e6885744cbdb665f2ff2fdef5690")
+  , (2, "51494e024076d2e8a92ec33b94adcd69b063a9d969e7f02bb7ed3b91387c410d", "26a631d25480c2aa8c3b41eca55973da249c5e167782c92f11be758432b6d75f")
+  , (3, "1d4e80d159ccc876965833eef7b35294e0f7c300dd73472d2d002918925bbbc5", "7673967e83d68d29ac14a91611ef584b32cf81d116c930ee73b0c49b1771fa42")
+  , (4, "547c29a6096d3b28b61c859167fb1a9c1017d9283a63d740045f2f7cba8a1881", "3044be45405ccf5895ab9af1eb693b955d742f085f4ca1fabdc89aa09addc0b9")
+  , (5, "6726a0250cd288d0677a5c766f05039e2f43e22dcf1b0c0151b73e4c06eeedfb", "577eae5dc0b017d9c2276069bda11c600fc46b257c2a8fb191234c80878a7b32")
+  , (6, "51ee56fa7da3c1bef3288d1ef21be0e8d71b26bd48a193f5b48fbe925089bd93", "55102af52db4dc3158a15bebf60c79bd1cafc292335531c790b613c41ccaa1aa")
+  ]
+
+sigFor : Int -> EvmSignature
+sigFor n = case [ (r, s) | (m, r, s) <- signatures, m == n ] of
+  [(r, s)] -> EvmSignature with publicKey = testKey; r; s; nonce = n; expiresAt = expiry
+  _ -> error "no signature for nonce"
+
+data EvmEnv = EvmEnv with env : Env; custody : Party
+
+-- | Protocol with operator "EOperator", custodian "EvmCustody", the address's account open.
+setupEvm : Script EvmEnv
+setupEvm = do
+  env <- setupWith (\n -> allocatePartyByHint (PartyIdHint ("E" <> n)))
+  custody <- allocatePartyByHint (PartyIdHint "EvmCustody")
+  directoryCid <- submit (actAs [env.operator, custody]) $ createCmd EvmDirectory with
+    operator = env.operator; custody; network = "canton:test"; addresses = Set.empty
+  _ <- submit env.operator $ exerciseCmd directoryCid EvmDirectory_Open with address = testAddress
+  seedLiquidity env 20000.0
+  pure EvmEnv with ..
+
+walletOf : EvmEnv -> Script (ContractId EvmWallet, EvmWallet)
+walletOf e = do
+  ws <- queryFilter @EvmWallet e.custody (\w -> w.address == testAddress)
+  case ws of
+    [w] -> pure w
+    _ -> abort "expected exactly one EvmWallet"
+
+evmAccountOf : EvmEnv -> Script (ContractId Account, Account)
+evmAccountOf e = do
+  as <- queryFilter @Account e.env.operator (\a -> a.evmAddress == Some testAddress)
+  case as of
+    [a] -> pure a
+    _ -> abort "expected exactly one EVM Account"
+
+-- | The registry offers a transfer to the custodian; the custodian credits it to the address's wallet.
+receive : EvmEnv -> H.InstrumentId -> Decimal -> Script ()
+receive e instrumentId amount = do
+  now <- getTime
+  offerCid <- submit instrumentId.admin $ createCmd TokenTransferOffer with
+    transfer = Transfer with
+      sender = instrumentId.admin; receiver = e.custody; amount; instrumentId
+      requestedAt = now; executeBefore = addRelTime now (minutes 60)
+      inputHoldingCids = []; meta = emptyMetadata
+  (walletCid, _) <- walletOf e
+  _ <- submit e.custody $ exerciseCmd walletCid EvmWallet_Receive with
+    instructionCid = toInterfaceContractId @TransferInstruction offerCid
+    extraArgs = noExtraArgs
+  pure ()
+
+-- | Signed pool operation: holdings are the custodian's (payment) or the operator's (payout).
+evmCmd : EvmEnv -> EvmAction -> EvmSignature -> Bool -> Script (Commands (ContractId Pool, ContractId Account, ContractId EvmWallet))
+evmCmd e action signature pays = do
+  let env = e.env
+  (configCid, config) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (pauseCid, _) <- currentPause env
+  (walletCid, _) <- walletOf e
+  (accountCid, _) <- evmAccountOf e
+  prices <- allPrices env
+  let instrument = case action of
+        EvmDepositCollateral{marketId = m} -> (fromSome (Map.lookup m config.marketParams)).collateralInstrument
+        EvmWithdrawCollateral{marketId = m} -> (fromSome (Map.lookup m config.marketParams)).collateralInstrument
+        _ -> env.usdcx
+  transfer <- transferArgs (if pays then e.custody else env.operator) instrument
+  pure $ exerciseCmd poolCid Pool_EvmExecute with
+    custody = e.custody; configCid; pauseCid; walletCid; accountCid; action; signature; prices; transfer
+
+runEvm : EvmEnv -> EvmAction -> EvmSignature -> Bool -> Script ()
+runEvm e action signature pays = do
+  cmd <- evmCmd e action signature pays
+  ds <- disclosures e.env
+  _ <- submit (actAs e.custody <> discloseMany ds) cmd
+  pure ()
+
+failEvm : EvmEnv -> EvmAction -> EvmSignature -> Bool -> Text -> Script ()
+failEvm e action signature pays expected = do
+  cmd <- evmCmd e action signature pays
+  ds <- disclosures e.env
+  r <- trySubmit (actAs e.custody <> discloseMany ds) cmd
+  case r of
+    Left err -> unless' (expected `T.isInfixOf` show err) ("expected '" <> expected <> "', got " <> show err)
+    Right _ -> abort ("expected failure: " <> expected)
+
+unless' : Bool -> Text -> Script ()
+unless' ok msg = if ok then pure () else abort msg
+
+balance : EvmEnv -> H.InstrumentId -> Script Decimal
+balance e i = do
+  (_, w) <- walletOf e
+  pure (Evm.balanceOf i w.balances)
+
+-- End-to-end scenario -----------------------------------------------------------------
+
+test_evmFullFlow : Script ()
+test_evmFullFlow = do
+  e <- setupEvm
+  let env = e.env
+  receive e env.usdcx 1000.0
+  receive e env.cbtc 0.05
+  balance e env.usdcx >>= (=== 1000.0)
+  -- the custodian holds the tokens as holdings, the wallet holds the address's share
+  balanceOf' e.custody env.usdcx >>= (=== 1000.0)
+
+  runEvm e (EvmSupply with amount = 500.0; full = False) (sigFor 0) True
+  balance e env.usdcx >>= (=== 500.0)
+  (_, account) <- evmAccountOf e
+  account.principal === 500.0
+
+  runEvm e (EvmDepositCollateral with marketId = "CBTC"; amount = 0.05) (sigFor 1) True
+  balance e env.cbtc >>= (=== 0.0)
+
+  -- the deposit first, then 1 000 of debt
+  runEvm e (EvmBorrow with amount = 1500.0) (sigFor 2) False
+  balance e env.usdcx >>= (=== 2000.0)
+  (_, account) <- evmAccountOf e
+  account.principal === -1000.0
+
+  runEvm e (EvmSupply with amount = 1010.0; full = True) (sigFor 3) True
+  balance e env.usdcx >>= (=== 1000.0)
+
+  runEvm e (EvmWithdrawCollateral with marketId = "CBTC"; amount = 0.05) (sigFor 4) False
+  balance e env.cbtc >>= (=== 0.05)
+  runEvm e (EvmSupply with amount = 500.0; full = False) (sigFor 5) True
+  runEvm e (EvmWithdraw with amount = 1.0; full = True) (sigFor 6) False
+  balance e env.usdcx >>= (=== 1000.0)
+  (_, w) <- walletOf e
+  w.nonce === 7
+  balanceOf' e.custody env.usdcx >>= (=== 1000.0)
+
+balanceOf' : Party -> H.InstrumentId -> Script Decimal
+balanceOf' = balanceOf
+
+-- Rejections ---------------------------------------------------------------------------
+
+test_evmRejects : Script ()
+test_evmRejects = do
+  e <- setupEvm
+  let env = e.env
+  receive e env.usdcx 1000.0
+  let supply = EvmSupply with amount = 500.0; full = False
+  -- amount differs from the signed one
+  failEvm e (EvmSupply with amount = 600.0; full = False) (sigFor 0) True "does not match the operation"
+  -- "mirrored" signature n - s (EIP-2)
+  let high = (sigFor 0) with s = "a34d6bb8171916c63b7dc2a79799f0058572ffe13f9b9424a810bb134732ef9b"
+  failEvm e supply high True "lower half of the curve order"
+  -- signature by another key under this address
+  let other = (sigFor 0) with
+        publicKey = "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1"
+        r = "8f0d2183a571e89dcef720128f6a760046f267f726fa949bd5f49ea90a9edc80"
+        s = "187ada9ecb5e8594d9a467c527f8947505a364d78ddabc7768e2f2d5255644a4"
+  failEvm e supply other True "key does not match the account address"
+  -- wrong nonce
+  failEvm e supply ((sigFor 0) with nonce = 1) True "nonce is stale"
+  -- a regular pool choice does not move an EVM account
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (accountCid, _) <- evmAccountOf e
+  payment <- transferArgs e.custody env.usdcx
+  ds <- disclosures env
+  r <- trySubmit (actAs e.custody <> discloseMany ds) $ exerciseCmd poolCid Pool_SupplyBase with
+    user = e.custody; configCid; accountCid; amount = 500.0; full = False; payment
+  case r of
+    Left err -> unless' ("needs the EVM wallet signature" `T.isInfixOf` show err) (show err)
+    Right _ -> abort "regular supply moved an EVM account"
+  -- a valid signature passes, a replay does not
+  runEvm e supply (sigFor 0) True
+  failEvm e supply (sigFor 0) True "nonce is stale"
+  -- a wallet without tokens does not pay the pool with the custodian's other holdings
+  failEvm e (EvmDepositCollateral with marketId = "CBTC"; amount = 0.05) (sigFor 1) True "insufficient CBTC in the EVM wallet"
+  -- expired signature
+  passTime (minutes 21)
+  failEvm e (EvmDepositCollateral with marketId = "CBTC"; amount = 0.05) (sigFor 1) True "signature expired"
+
+-- Pure functions: TS vector and DER edge cases -----------------------------------------
+
+test_evmVector : Script ()
+test_evmVector = do
+  let operator = fromSome (partyFromText "Operator::1220abcd")
+      message = evmMessage "canton:devnet" operator testAddress (actionLine "USDCx" (EvmSupply with amount = 100.0; full = False)) 0
+        (time (date 2030 Jan 1) 0 0 0)
+      sig = EvmSignature with
+        publicKey = testKey
+        r = "ef8b5141f0a0d4d83f6bd5d3edcb1e9dba1a678bdc86b5171e8700494830078d"
+        s = "5ff29cdac5cba77846ac18be043f6f4b8e2ea8480aff729c8913b4a74a7972c1"
+        nonce = 0; expiresAt = time (date 2030 Jan 1) 0 0 0
+  message === "Canton Lending\nSupply 100.0 USDCx\nAccount: 0x2c7536e3605d9c16a7a3d7b1898e529396a65c23\nNetwork: canton:devnet\nOperator: Operator::1220abcd\nNonce: 0\nExpires: 2030-01-01T00:00:00Z"
+  personalDigest message === "9f4955d930554c6a33dd6c91736e758a42bd3303a476aaa9e337a71aea4bd1c1"
+  addressOfKey testKey === testAddress
+  checkEvmSignature testAddress message sig === Right ()
+  -- leading zero byte and high bit: DER without leading zeros and with 00 before 0x80+
+  derSignature (T.implode (replicate 62 "0") <> "7f") ("80" <> T.implode (replicate 62 "1"))
+    === ("3026" <> "02017f" <> "022100" <> "80" <> T.implode (replicate 62 "1"))
+  isEvmAddress "0x2C7536e3605d9c16a7a3d7b1898e529396a65c23" === False
+  isEvmAddress testAddress === True

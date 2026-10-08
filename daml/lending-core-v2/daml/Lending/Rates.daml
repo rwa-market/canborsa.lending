@@ -1,0 +1,95 @@
+-- | Interest (K8): our kink borrow rate, Compound's utilization and balances.
+module Lending.Rates
+  ( utilization
+  , borrowRate
+  , supplyRate
+  , accrue
+  , totalDebt
+  , totalSupply
+  , reserves
+  , presentSupply
+  , presentDebt
+  , presentValue
+  , principalValue
+  ) where
+
+import Lending.Math
+import Lending.Types
+
+-- | U = debt / supply (getUtilization), at most 1. No supply with debt: 1; neither: 0.
+-- Starting reserves sit in cash and do not lower U.
+utilization : N -> N -> N
+utilization debt supply
+  | debt <= 0.0 = 0.0
+  | supply <= 0.0 = 1.0
+  | otherwise = minN 1.0 (divN debt supply)
+
+-- | Annual borrow rate under the kink model.
+borrowRate : RateModel -> N -> N
+borrowRate m u
+  | u <= m.optimalUtilization =
+      m.baseRate + mulN m.slope1 (divN u m.optimalUtilization)
+  | otherwise =
+      m.baseRate + m.slope1
+        + mulN m.slope2 (divN (u - m.optimalUtilization) (1.0 - m.optimalUtilization))
+
+-- | Annual supplier rate: borrow rate × U × (1 − reserveFactor).
+supplyRate : RateModel -> N -> N
+supplyRate m u = mulN (mulN (borrowRate m u) u) (1.0 - m.reserveFactor)
+
+-- | Pool debt, rounded up: in the protocol's favour.
+totalDebt : PoolState -> N
+totalDebt s = mulUp s.totalBorrowPrincipal s.borrowIndex
+
+-- | Pool supply, rounded up: reserves computed from it are not overstated.
+totalSupply : PoolState -> N
+totalSupply s = mulUp s.totalSupplyPrincipal s.supplyIndex
+
+-- | Reserves = cash + debt − supply (getReserves). Can be negative after bad debt.
+reserves : PoolState -> N
+reserves s = s.cash + mulDown s.totalBorrowPrincipal s.borrowIndex - totalSupply s
+
+presentSupply : PoolState -> N -> N
+presentSupply s principal = mulDown principal s.supplyIndex
+
+presentDebt : PoolState -> N -> N
+presentDebt s principal = mulUp principal s.borrowIndex
+
+-- | Signed balance of a principal (presentValue): a deposit rounded down, a debt rounded up.
+presentValue : PoolState -> N -> N
+presentValue s principal
+  | principal >= 0.0 = presentSupply s principal
+  | otherwise = negate (presentDebt s (negate principal))
+
+-- | Principal of a signed balance (principalValue): a deposit rounded down, a debt rounded up.
+principalValue : PoolState -> N -> N
+principalValue s balance
+  | balance >= 0.0 = divDown balance s.supplyIndex
+  | otherwise = negate (divUp (negate balance) s.borrowIndex)
+
+-- | Accrue interest from `lastUpdate` to `now`. Debt grows continuously: × e^(r·dt).
+-- Suppliers get (1 − reserveFactor) of the interest through supplyIndex; the rest stays in
+-- reserves by itself (reserves = cash + debt − supply). Without supply all interest is reserves.
+accrue : RateModel -> Time -> PoolState -> PoolState
+accrue m now s
+  | dt <= 0.0 || s.totalBorrowPrincipal <= 0.0 = s with lastUpdate = max now s.lastUpdate
+  | otherwise =
+      let debt = mulN s.totalBorrowPrincipal s.borrowIndex
+          supply = mulN s.totalSupplyPrincipal s.supplyIndex
+          rate = borrowRate m (utilization debt supply)
+          growth = expN (divN (mulN rate dt) secondsPerYear)
+          interest = mulN debt (growth - 1.0)
+          -- 1.0.2 (audit H2): suppliers earn rate × min(U, 1) × (1 − reserveFactor), as supplyRate
+          -- shows. With debt above supply the uncapped share made a dust deposit earn the reserves
+          share = if supply >= debt then 1.0 else divDown supply debt
+          toSuppliers = mulDown (mulDown interest (1.0 - m.reserveFactor)) share
+          supplyIndex' =
+            if supply <= 0.0 then s.supplyIndex
+            else mulDown s.supplyIndex (1.0 + divDown toSuppliers supply)
+      in s with
+           -- the debt index rounds up, the supply index down: rounding favours the protocol
+           borrowIndex = mulUp s.borrowIndex growth
+           supplyIndex = supplyIndex'
+           lastUpdate = now
+  where
+    dt = secondsBetween s.lastUpdate now

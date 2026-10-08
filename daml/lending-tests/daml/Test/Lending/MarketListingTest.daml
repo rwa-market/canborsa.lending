@@ -1,0 +1,112 @@
+-- | New collateral market (0.5.0): the council threshold and the operator add the market to the config and pool
+-- in one transaction. Config_Update still does not change the market set (audit D-3).
+module Test.Lending.MarketListingTest where
+
+import DA.Map qualified as Map
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as H
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+
+import Lending.Config
+import Lending.Governance
+import Lending.Oracle
+import Lending.Pool
+import Lending.Types
+import Test.Lending.Env
+import Test.Lending.GovernanceTest (Council (..), setupCouncil)
+
+-- | A test asset TKN issued by the CC registry: the test token factory serves any id of its admin.
+tknOf : Env -> H.InstrumentId
+tknOf env = H.InstrumentId with admin = env.cc.admin; id = "TKN"
+
+tknParams : H.InstrumentId -> MarketParams
+tknParams tkn = (ccMarketParams tkn) with
+  borrowCollateralFactor = 0.7; liquidateCollateralFactor = 0.8; liquidationFactor = 0.95
+  supplyCap = 100.0; minCollateralAmount = 0.001
+
+proposeEth : Env -> Council -> Script (ContractId MarketListingProposal)
+proposeEth env c = do
+  rules <- rulesFor env.cc
+  now <- getTime
+  submit c.m1 $ exerciseCmd c.cid Council_ProposeMarket with
+    proposer = c.m1; proposalId = "list-tkn"; marketId = "TKN"
+    market = tknParams (tknOf env)
+    factory = toInterfaceContractId @TransferFactory rules
+    expiresAt = addRelTime now (days 3)
+
+test_listMarket : Script ()
+test_listMarket = do
+  env <- setup
+  c <- setupCouncil env
+  seedLiquidity env 20000.0
+  let tkn = tknOf env
+  (configCid, config) <- currentConfig env
+  -- without a listing the new market does not get into the config (D-3)
+  submitMustFail (actAs (env.operator :: config.governors)) $ exerciseCmd configCid Config_Update with
+    newParams = config.params
+    newMarketParams = Map.insert "TKN" (tknParams tkn) config.marketParams
+    newTransferFactories = None; newFeaturedAppRight = None; newRoles = None
+  p <- proposeEth env c
+  (poolCid, _) <- currentPool env
+  -- one signature is not enough, a council member without the operator does not execute
+  submitMustFail env.operator $ exerciseCmd p MarketListing_Execute with configCid; poolCid
+  p <- submit c.m2 $ exerciseCmd p MarketListing_Approve with approver = c.m2
+  submitMustFail c.m1 $ exerciseCmd p MarketListing_Execute with configCid; poolCid
+  _ <- submit env.operator $ exerciseCmd p MarketListing_Execute with configCid; poolCid
+  (_, config') <- currentConfig env
+  (_, pool') <- currentPool env
+  assertMsg "config lists TKN" (Map.member "TKN" config'.marketParams)
+  assertMsg "pool lists TKN" (Map.member "TKN" pool'.markets)
+  assertMsg "TKN factory trusted" (Map.member tkn config'.transferFactories)
+
+  -- Bob deposits TKN and borrows against it
+  now <- getTime
+  _ <- submit env.oracle $ createCmd PriceFeed with
+    oracle = env.oracle; instrumentId = tkn
+    quotes = [PriceQuote "source-a" 2500.0 now, PriceQuote "source-b" 2500.0 now]
+    observers = [env.operator]
+  mint env tkn env.bob 2.0
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (pauseCid, _) <- currentPause env
+  (accountCid, _) <- accountOf env env.bob
+  tknFeed <- feedFor env tkn
+  payment <- transferArgs env.bob tkn
+  ds <- disclosures env
+  _ <- submit (actAs env.bob <> discloseMany ds) $ exerciseCmd poolCid Pool_SupplyCollateral with
+    user = env.bob; configCid; accountCid; marketId = "TKN"; amount = 2.0; payment
+  (poolCid, _) <- currentPool env
+  (accountCid, _) <- accountOf env env.bob
+  debtFeed <- feedFor env env.usdcx
+  payout <- transferArgs env.operator env.usdcx
+  ds <- disclosures env
+  _ <- submit (actAs env.bob <> discloseMany ds) $ exerciseCmd poolCid Pool_WithdrawBase with
+    user = env.bob; configCid; pauseCid; accountCid; amount = 2000.0; full = False; allowBorrow = True
+    prices = PriceArgs with collateralFeedCids = [tknFeed]; debtFeedCid = Some debtFeed; attestationCids = []
+    payout
+  balance <- balanceFor env env.bob
+  assertMsg "Bob borrowed against TKN" (balance == -2000.0)
+
+test_listMarketRejects : Script ()
+test_listMarketRejects = do
+  env <- setup
+  c <- setupCouncil env
+  rules <- rulesFor env.cc
+  now <- getTime
+  let propose marketId market = submitMustFail c.m1 $ exerciseCmd c.cid Council_ProposeMarket with
+        proposer = c.m1; proposalId = "bad"; marketId; market
+        factory = toInterfaceContractId @TransferFactory rules
+        expiresAt = addRelTime now (days 3)
+  propose "tkn" (tknParams (tknOf env))
+  propose "TKN" ((tknParams (tknOf env)) with borrowCollateralFactor = 0.9)
+  -- a market with an existing id and another market's instrument make the config reject at execution
+  p <- submit c.m1 $ exerciseCmd c.cid Council_ProposeMarket with
+    proposer = c.m1; proposalId = "dup"; marketId = "CC2"; market = ccMarketParams env.cc
+    factory = toInterfaceContractId @TransferFactory rules
+    expiresAt = addRelTime now (days 3)
+  p <- submit c.m2 $ exerciseCmd p MarketListing_Approve with approver = c.m2
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  submitMustFail env.operator $ exerciseCmd p MarketListing_Execute with configCid; poolCid

@@ -1,0 +1,3 @@
+# Base DARs of released versions for dpm upgrade-check (sh scripts/daml.sh upgrade-check).
+# The root .gitignore excludes *.dar; here we keep them in git.
+!*.dar

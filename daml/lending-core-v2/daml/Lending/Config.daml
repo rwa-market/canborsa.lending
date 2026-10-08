@@ -1,0 +1,165 @@
+-- | Protocol parameters, roles and trusted token factories (T1.1.1, audit K1, V1).
+-- Signed by the operator and the governance council. The pool reads the config in every operation:
+-- the council sees only this read, not user operations and positions.
+module Lending.Config where
+
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import DA.List (unique)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Text qualified as T
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight)
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+
+import Lending.Rewards (checkFeaturedRight)
+import Lending.Types
+
+-- | Transfer factory the protocol trusts for an instrument.
+-- The contract does not accept a factory from user arguments (audit K1, K2).
+type TransferFactories = Map InstrumentId (ContractId TransferFactory)
+
+-- | Featured App right change in a council proposal (re-audit, H2).
+-- The council can remove the right by threshold; setting a new one needs unanimity with the operator
+-- (Proposal_ExecuteTrusted): the right's body is exercised with the operator's authority.
+data FeaturedRightChange
+  = FeaturedRight_Clear
+  | FeaturedRight_Set (ContractId FeaturedAppRight)
+  deriving (Eq, Show)
+
+template ProtocolConfig
+  with
+    roles : Roles
+    governors : [Party]
+      -- ^ k-of-n council (T4.1.1). Empty: parameters are changed by the operator
+    params : ProtocolParams
+    marketParams : Map MarketId MarketParams
+    transferFactories : TransferFactories
+    featuredAppRight : Optional (ContractId FeaturedAppRight)
+      -- ^ Featured App right from the DSO (§10); None: markers are not created
+    dso : Optional Party
+      -- ^ 0.4.0, audit D-1: DSO of the network that issues the Featured App right. Some: a right
+      --   from another party is not accepted. None: config from before 0.4.0, DSO is not checked
+  where
+    signatory roles.operator, governors
+    ensure null (validateProtocolParams params)
+      && null (validateRoles roles)
+      && unique governors
+      && all (`notElem` roleParties roles) governors
+      && all (null . validateMarketParams) (Map.values marketParams)
+      && Map.member params.debtInstrument transferFactories
+      && all (\m -> Map.member m.collateralInstrument transferFactories) (Map.values marketParams)
+      && all (\m -> m.collateralInstrument /= params.debtInstrument) (Map.values marketParams)
+      && roles.operator `notElem` governors
+
+    -- | Change parameters. Needs the authority of the operator and the whole council:
+    -- only an executed council proposal gives it (Lending.Governance).
+    choice Config_Update : ContractId ProtocolConfig
+      with
+        newParams : ProtocolParams
+        newMarketParams : Map MarketId MarketParams
+        newTransferFactories : Optional TransferFactories
+        newFeaturedAppRight : Optional (ContractId FeaturedAppRight)
+          -- ^ Some: replace the right; None: keep as is
+        newRoles : Optional Roles
+          -- ^ 0.4.0, audit D-5: Some: change roles (except operator); None: keep
+      controller roles.operator :: governors
+      do
+        -- Audit D-3: the pool stores market state and checks the set against the config in every
+        -- operation. A market added or removed in the config would stop all pool operations.
+        unless (Map.keys newMarketParams == Map.keys marketParams)
+          (abort "market set cannot change: markets are added only together with the pool")
+        unless (all (\(k, m) -> optional True (\old -> old.collateralInstrument == m.collateralInstrument) (Map.lookup k marketParams)) (Map.toList newMarketParams))
+          (abort "collateral instrument of a market cannot change")
+        unless (newParams.debtInstrument == params.debtInstrument) (abort "debt instrument cannot change")
+        forA_ newRoles \r -> unless (r.operator == roles.operator) (abort "operator cannot change")
+        forA_ newFeaturedAppRight (checkFeaturedRight roles.operator dso)
+        create this with
+          params = newParams
+          marketParams = newMarketParams
+          transferFactories = optional transferFactories identity newTransferFactories
+          featuredAppRight = optional featuredAppRight Some newFeaturedAppRight
+          roles = optional roles identity newRoles
+
+    -- | Add a collateral market (0.5.0). Config_Update does not change the market set (audit D-3):
+    -- the pool checks it in every operation. This choice is called only together with Pool_AddMarket
+    -- in one transaction: MarketListing_Execute in lending-governance (council threshold and operator).
+    choice Config_AddMarket : ContractId ProtocolConfig
+      with
+        marketId : MarketId
+        market : MarketParams
+        factory : ContractId TransferFactory
+          -- ^ trusted factory of the collateral instrument; for an instrument that already has one, the same
+      controller roles.operator :: governors
+      do
+        unless (validMarketId marketId) (abort "market id must be 1-12 characters A-Z and 0-9")
+        unless (not (Map.member marketId marketParams)) (abort "market already listed")
+        unless (all (\m -> m.collateralInstrument /= market.collateralInstrument) (Map.values marketParams))
+          (abort "instrument is already collateral of another market")
+        case Map.lookup market.collateralInstrument transferFactories of
+          Some trusted -> unless (trusted == factory) (abort "instrument already has another trusted factory")
+          None -> pure ()
+        create this with
+          marketParams = Map.insert marketId market marketParams
+          transferFactories = Map.insert market.collateralInstrument factory transferFactories
+
+    -- | Remove a collateral market (0.8.0). Called only together with Pool_RemoveMarket in one
+    -- transaction: Delisting_Execute in lending-governance (council threshold and operator).
+    choice Config_RemoveMarket : ContractId ProtocolConfig
+      with
+        marketId : MarketId
+      controller roles.operator :: governors
+      do
+        unless (not (null governors)) (abort "a market is removed only under a council")
+        unless (Map.member marketId marketParams) (abort ("unknown market " <> marketId))
+        -- 1.0.2: the instrument's trusted factory stays: EVM and Loop wallets may still hold the
+        -- instrument and transfer it out. A re-listing of the instrument must use the same factory.
+        create this with marketParams = Map.delete marketId marketParams
+
+    -- | Hand the config over to the council. Called by the operator while there is no council.
+    choice Config_SetGovernors : ContractId ProtocolConfig
+      with
+        newGovernors : [Party]
+      controller roles.operator :: governors <> newGovernors
+      do create this with governors = newGovernors
+
+    -- | Remove or replace the Featured App right (re-audit, H2). The right is not a risk parameter:
+    -- the DSO can revoke it, and then every money operation fails on fetch. The operator
+    -- removes a dead right itself, without the council. The right's body is exercised only with the authority
+    -- of the operator, and the operator is a trusted custodian anyway (ADR-002, D10).
+    choice Config_SetFeaturedAppRight : ContractId ProtocolConfig
+      with
+        newFeaturedAppRight : Optional (ContractId FeaturedAppRight)
+          -- ^ None: remove the right; Some: set a new one
+      controller roles.operator
+      do
+        unless (newFeaturedAppRight /= featuredAppRight) (abort "featured app right unchanged")
+        forA_ newFeaturedAppRight (checkFeaturedRight roles.operator dso)
+        create this with featuredAppRight = newFeaturedAppRight
+
+-- | 0.8.0: the config of the council that removed a market or an instrument. Accounts and wallets
+-- drop their state for it with the authority of the operator and this council (controllers of the
+-- drop choices), and the config proves that the market or the instrument is gone. The governors must
+-- not be empty: without a council the operator alone would write off user positions.
+governedConfig : Party -> [Party] -> ContractId ProtocolConfig -> Update ProtocolConfig
+governedConfig operator governors configCid = do
+  config <- fetch configCid
+  unless (config.roles.operator == operator) (abort "config belongs to another operator")
+  unless (not (null governors) && config.governors == governors) (abort "config is not governed by this council")
+  pure config
+
+-- | 0.8.0: an instrument that neither the debt nor any market of the config uses any more.
+requireInstrumentDelisted : ProtocolConfig -> InstrumentId -> Update ()
+requireInstrumentDelisted config instrument = do
+  unless (instrument /= config.params.debtInstrument) (abort "the debt instrument cannot be dropped")
+  unless (not (Map.member instrument config.transferFactories)) (abort "instrument is still listed")
+
+-- | Market id: uppercase Latin letters and digits, up to 12 chars (CC, CBTC, ETH, SOL).
+validMarketId : MarketId -> Bool
+validMarketId m = T.length m >= 1 && T.length m <= 12 && all (`elem` T.explode "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") (T.explode m)
+
+marketParamsOf : ProtocolConfig -> MarketId -> Update MarketParams
+marketParamsOf config marketId = case Map.lookup marketId config.marketParams of
+  None -> abort ("unknown market " <> marketId)
+  Some m -> pure m

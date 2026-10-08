@@ -1,0 +1,132 @@
+-- | LocalNet probe for two open questions of the Compound V3 migration (ADR-009):
+--   1. the guardian is an observer of PauseState, not a signatory: do pool operations commit while
+--      the guardian's participant is offline?
+--   2. how much sequencer traffic does each pool operation cost?
+--
+-- The guardian lives on participant p2, every other party on the default participant (p1). Each
+-- step is a separate `dpm script` run: deploy/bitsafe-localnet/07-traffic-guardian.sh reads the
+-- traffic state of both participants through the Admin API between the runs and takes p2 off the
+-- synchronizer for the guardian check. A measured step does only its operation; the price refresh
+-- it needs (prices are valid for 300 s) runs as its own unmeasured step before it.
+--
+--   dpm script --dar lending-tests-<v>.dar --script-name Test.Lending.LocalNetProbe:step \
+--     --participant-config participants.json --input-file in.json --output-file out.json
+module Test.Lending.LocalNetProbe where
+
+import DA.Text qualified as T
+import DA.Time (seconds)
+import Daml.Script
+
+import Lending.Pause
+import Test.Lending.Env
+
+-- | The environment of a run and the account absorbed while the guardian is offline.
+data ProbeState = ProbeState with
+    env : Env
+    dave : Party
+    note : Text
+      -- ^ what the last step did or how the ledger answered
+
+data ProbeInput = ProbeInput with
+    prefix : Text
+      -- ^ party-name prefix, new per run on a persistent ledger
+    ledgerUser : Text
+    stepName : Text
+    state : Optional ProbeState
+
+because : Show e => Either e a -> Text
+because (Left e) = "REJECTED: " <> T.take 200 (show e)
+because (Right _) = "accepted"
+
+-- | Allocate on a participant and let the script's user act as the party there.
+allocateOn : ProbeInput -> Optional Text -> Text -> Script Party
+allocateOn input participant name = do
+  uid <- validateUserId input.ledgerUser
+  case participant of
+    None -> do
+      p <- allocateParty (input.prefix <> name)
+      _ <- grantUserRights uid [CanActAs p, CanReadAs p]
+      pure p
+    Some n -> do
+      p <- allocatePartyOn (input.prefix <> name) (ParticipantName n)
+      _ <- grantUserRightsOn uid [CanActAs p, CanReadAs p] (ParticipantName n)
+      -- p1 must know the new party before it can make it an observer
+      waitKnown p 60
+      pure p
+
+waitKnown : Party -> Int -> Script ()
+waitKnown p n = do
+  known <- listKnownParties
+  if any (\d -> d.party == p) known then pure ()
+  else if n <= 0 then abort ("party not visible on the default participant: " <> show p)
+  else sleep (seconds 1) >> waitKnown p (n - 1)
+
+step : ProbeInput -> Script ProbeState
+step input = case (input.stepName, input.state) of
+  ("setup", _) -> do
+    env <- setupWith \name ->
+      allocateOn input (if name == "Guardian" then Some "p2" else None) name
+    dave <- allocateOn input None "Dave"
+    openAccount env dave
+    mint env env.cc dave 50000.0
+    mint env env.cbtc env.bob 1.0
+    seedLiquidity env 20000.0
+    -- Carol and Dave borrow 3 000 against 50 000 CC: absorbable at CC $0.13 (example 4)
+    run env env.carol (depositCmd env env.carol "CC" 50000.0)
+    run env env.carol (borrowCmd env env.carol 3000.0)
+    run env dave (depositCmd env dave "CC" 50000.0)
+    run env dave (borrowCmd env dave 3000.0)
+    mint env env.usdcx env.liquidator 10000.0
+    pure ProbeState with env; dave; note = "deployed; guardian on p2"
+  (name, Some s) -> do
+    let env = s.env
+    note <- case name of
+      "refresh" -> refreshPrices env >> pure "prices refreshed"
+      -- measured operations, one transaction each
+      "supplyBase" -> ok (run env env.alice (supplyCmd env env.alice 100.0))
+      "supplyCollateral" -> ok (run env env.bob (depositCmd env env.bob "CC" 20000.0))
+      "borrow1" -> ok (run env env.bob (borrowCmd env env.bob 300.0))
+      "withdrawCollateral1" -> ok (run env env.bob (withdrawCollateralCmd env env.bob "CC" 100.0))
+      "supplyCollateralCbtc" -> ok (run env env.bob (depositCmd env env.bob "CBTC" 0.1))
+      "borrow2" -> ok (run env env.bob (borrowCmd env env.bob 300.0))
+      "withdrawCollateral2" -> ok (run env env.bob (withdrawCollateralCmd env env.bob "CC" 100.0))
+      "repay" -> ok (run env env.bob (supplyCmd env env.bob 100.0))
+      "priceUpdate" -> ok (setPrice env env.cc 0.13)
+      "absorb" -> ok (absorb env env.carol)
+      "buy" -> ok (run env env.liquidator (buyCmd env env.liquidator "CC" 1000.0 0.0))
+      "pauseFlag" -> ok (guardianSets env BorrowFlag True)
+      "unpauseFlag" -> ok (guardianSets env BorrowFlag False)
+      -- the guardian's participant is offline: operations that read PauseState
+      "offline" -> do
+        r1 <- tryRun env env.bob (borrowCmd env env.bob 100.0)
+        r2 <- tryRun env env.bob (withdrawCollateralCmd env env.bob "CC" 100.0)
+        prices <- allPrices env
+        r3 <- absorbCmdWith env s.dave prices >>= trySubmit env.operator
+        r4 <- tryRun env env.liquidator (buyCmd env env.liquidator "CC" 100.0 0.0)
+        pure ("borrow " <> because r1 <> "; withdraw collateral " <> because r2
+          <> "; absorb " <> because r3 <> "; buy collateral " <> because r4)
+      -- back online: the guardian pauses borrowing, a loan is refused, the guardian lifts it
+      "online" -> do
+        guardianSets env BorrowFlag True
+        r <- tryRun env env.bob (borrowCmd env env.bob 100.0)
+        guardianSets env BorrowFlag False
+        r' <- tryRun env env.bob (borrowCmd env env.bob 100.0)
+        pure ("guardian paused borrowing; borrow " <> because r <> "; unpaused; borrow " <> because r')
+      _ -> abort ("unknown step " <> name)
+    pure s with note
+  (name, None) -> abort ("step " <> name <> " needs the state of the setup step")
+
+ok : Script () -> Script Text
+ok act = act >> pure "accepted"
+
+tryRun : Env -> Party -> Script (Commands a) -> Script (Either SubmitError a)
+tryRun env user mk = do
+  cmd <- mk
+  ds <- disclosures env
+  trySubmit (actAs user <> discloseMany ds) cmd
+
+guardianSets : Env -> PauseFlag -> Bool -> Script ()
+guardianSets env flag paused = do
+  (cid, _) <- currentPause env
+  _ <- submit env.guardian $ exerciseCmd cid PauseState_SetFlag with flag; paused
+  pure ()

@@ -1,0 +1,9 @@
+sdk-version: 3.5.12
+
+packages:
+  - ./lending-core-v2
+  - ./lending-governance-v2
+  - ./lending-decman
+  - ./lending-mocks
+  - ./lending-deploy
+  - ./lending-tests

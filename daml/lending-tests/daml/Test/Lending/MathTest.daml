@@ -1,0 +1,149 @@
+-- | Pure functions of the Compound V3 model: parameters, utilization, rates, accrual, signed
+-- balances, borrow capacity and liquidation point, purchase price.
+module Test.Lending.MathTest where
+
+import DA.Assert ((===))
+import DA.Optional (fromSome)
+import DA.Time (addRelTime, days)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as H
+
+import Lending.Math
+import Lending.Pool (applyPrincipal, newPoolState, repayAndSupply, withdrawAndBorrow)
+import Lending.Rates
+import Lending.Risk
+import Lending.Types
+import Test.Lending.Env (approxEq)
+
+usdcx : H.InstrumentId
+usdcx = H.InstrumentId with admin = fromSome (partyFromText "Registry::1220ab"); id = "USDCx"
+
+-- Kink points of the borrow rate
+test_borrowRate : Script ()
+test_borrowRate = do
+  let m = defaultRateModel
+  borrowRate m 0.0 === 0.02
+  borrowRate m 0.65 === 0.1
+  borrowRate m 1.0 === 0.7
+  -- control example 10: U 65%, borrow 10%, supply 10% × 0.65 × 0.8 = 5.2%
+  supplyRate m 0.65 === 0.052
+
+-- K8: utilization is debt / supply; reserves in cash do not lower it
+test_utilization : Script ()
+test_utilization = do
+  utilization 6500.0 10000.0 === 0.65
+  utilization 0.0 0.0 === 0.0
+  utilization 100.0 0.0 === 1.0
+  utilization 12000.0 10000.0 === 1.0
+
+test_validation : Script ()
+test_validation = do
+  let p = defaultProtocolParams usdcx
+      cc = ccMarketParams usdcx
+  validateProtocolParams p === []
+  validateMarketParams cc === []
+  validateMarketParams (cbtcMarketParams usdcx) === []
+  -- borrow factor at the liquidation factor is rejected; zero is allowed (stops borrowing on the asset)
+  assertMsg "bcf = lcf rejected" (validateMarketParams (cc with borrowCollateralFactor = 0.45) /= [])
+  validateMarketParams (cc with borrowCollateralFactor = 0.0) === []
+  assertMsg "lcf > 1 rejected" (validateMarketParams (cc with liquidateCollateralFactor = 1.0001) /= [])
+  validateMarketParams (cc with liquidateCollateralFactor = 1.0) === []
+  assertMsg "liquidationFactor 0 rejected" (validateMarketParams (cc with liquidationFactor = 0.0) /= [])
+  validateMarketParams (cc with liquidationFactor = 1.0) === []
+  assertMsg "liquidationFactor > 1 rejected" (validateMarketParams (cc with liquidationFactor = 1.0001) /= [])
+  assertMsg "storeFrontPriceFactor > 1 rejected" (validateProtocolParams (p with storeFrontPriceFactor = 1.0001) /= [])
+  validateProtocolParams (p with storeFrontPriceFactor = 1.0) === []
+  assertMsg "negative target rejected" (validateProtocolParams (p with targetReserves = -1.0) /= [])
+  assertMsg "warning 1 rejected" (validateProtocolParams (p with liquidationRiskWarning = 1.0) /= [])
+
+-- Accrual: debt grows continuously, suppliers get (1 − reserveFactor), the rest stays in reserves
+test_accrue : Script ()
+test_accrue = do
+  now <- getTime
+  let m = defaultRateModel
+      s0 = (newPoolState now) with
+        totalSupplyPrincipal = 10000.0; totalBorrowPrincipal = 6500.0; cash = 3500.0 + 15000.0
+      s1 = accrue m (addRelTime now (days 365)) s0
+      interest = totalDebt s1 - 6500.0
+  -- 6 500 × (e^0.1 − 1) = 683.611
+  approxEq "interest" 0.001 683.611 interest
+  approxEq "suppliers get 80%" 0.001 (mulN interest 0.8) (totalSupply s1 - 10000.0)
+  approxEq "reserves keep 20%" 0.001 (15000.0 + mulN interest 0.2) (reserves s1)
+  -- reserves in cash do not change the rate: U = 65%
+  utilization (totalDebt s0) (totalSupply s0) === 0.65
+
+-- Signed balances round in the protocol's favour: a deposit down, a debt up
+test_signedBalance : Script ()
+test_signedBalance = do
+  now <- getTime
+  let s = (newPoolState now) with supplyIndex = 1.000000000000000003; borrowIndex = 1.000000000000000007
+  presentValue s 1.0 === 1.000000000000000003
+  presentValue s (-1.0) === -1.000000000000000007
+  -- a deposit principal rounds down and a debt principal up: the round trip never favours the user
+  assertMsg "deposit not overstated" (presentValue s (principalValue s 1.0) <= 1.0)
+  assertMsg "debt not understated" (presentValue s (principalValue s (-1.0)) <= -1.0)
+  presentValue s 0.0 === 0.0
+  -- a third of a unit at index 3: exact
+  let s3 = s with supplyIndex = 3.0; borrowIndex = 3.0
+  principalValue s3 1.0 === 0.333333333333333333
+  principalValue s3 (-1.0) === -0.333333333333333334
+
+-- Risk 8: the totals follow both crossings of zero
+test_totalsAcrossZero : Script ()
+test_totalsAcrossZero = do
+  now <- getTime
+  let s = (newPoolState now) with totalSupplyPrincipal = 1000.0; totalBorrowPrincipal = 1000.0
+  -- deposit 500 → debt 300: withdraws 500 of deposits, borrows 300
+  withdrawAndBorrow 500.0 (-300.0) === (500.0, 300.0)
+  let s1 = applyPrincipal s 500.0 (-300.0)
+  (s1.totalSupplyPrincipal, s1.totalBorrowPrincipal) === (500.0, 1300.0)
+  -- debt 1 000 → deposit 500: repays 1 000, supplies 500 (control example 2)
+  repayAndSupply (-1000.0) 500.0 === (1000.0, 500.0)
+  let s2 = applyPrincipal s (-1000.0) 500.0
+  (s2.totalSupplyPrincipal, s2.totalBorrowPrincipal) === (1500.0, 0.0)
+  -- within one side
+  repayAndSupply (-1000.0) (-400.0) === (600.0, 0.0)
+  repayAndSupply 100.0 400.0 === (0.0, 300.0)
+  withdrawAndBorrow 400.0 100.0 === (300.0, 0.0)
+  withdrawAndBorrow (-100.0) (-400.0) === (0.0, 300.0)
+
+-- Control example 1 in numbers: 20 000 CC and 0.1 CBTC
+test_capacityAndPoint : Script ()
+test_capacityAndPoint = do
+  let cc = CollateralLine with marketId = "CC"; amount = 20000.0; params = ccMarketParams usdcx; price = Some 0.2; attested = True
+      cbtc = CollateralLine with marketId = "CBTC"; amount = 0.1; params = cbtcMarketParams usdcx; price = Some 100000.0; attested = True
+  collateralValue [cc, cbtc] === 14000.0
+  borrowCapacity [cc, cbtc] === 6200.0
+  liquidationPoint [cc, cbtc] === Right 8300.0
+  -- risk 4: no price, zero for a borrow, absorb impossible; no attestation, zero for a borrow only
+  borrowCapacity [cc, cbtc with price = None] === 1200.0
+  assertMsg "absorb needs every price" (liquidationPoint [cc, cbtc with price = None] /= Right 1800.0)
+  borrowCapacity [cc, cbtc with attested = False] === 1200.0
+  liquidationPoint [cc, cbtc with attested = False] === Right 8300.0
+  -- a 5 000 loan: liquidation risk 5 000 / 8 300 = 60.2%
+  approxEq "risk 60.2%" 0.0001 0.6024 (divN 5000.0 8300.0)
+
+-- Control examples 4 and 6 in numbers: 50 000 CC against a 3 000 debt
+test_absorbNumbers : Script ()
+test_absorbNumbers = do
+  let cc price = CollateralLine with marketId = "CC"; amount = 50000.0; params = ccMarketParams usdcx; price = Some price; attested = True
+      credit price = mulDown (mulDown 50000.0 price) (ccMarketParams usdcx).liquidationFactor
+  -- example 4, CC $0.13: value 6 500, liquidation point 2 925 < debt 3 000, credited 6 045
+  collateralValue [cc 0.13] === 6500.0
+  liquidationPoint [cc 0.13] === Right 2925.0
+  credit 0.13 === 6045.0
+  -- at $0.134 the point is 3 015, above the debt
+  liquidationPoint [cc 0.134] === Right 3015.0
+  -- example 6, CC $0.05: value 2 500, credited 2 325, bad debt 3 000 − 2 325 = 675
+  collateralValue [cc 0.05] === 2500.0
+  credit 0.05 === 2325.0
+  3000.0 - credit 0.05 === 675.0
+
+-- Control example 5: purchase price 0.13 × (1 − 0.8 × 0.07) = 0.12272
+test_discountedPrice : Script ()
+test_discountedPrice = do
+  let p = defaultProtocolParams usdcx
+  discountedPrice p (ccMarketParams usdcx) 0.13 === 0.12272
+  -- CBTC: 5% penalty, buyer's discount 4%
+  discountedPrice p (cbtcMarketParams usdcx) 100000.0 === 96000.0

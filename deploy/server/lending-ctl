@@ -1,0 +1,201 @@
+#!/bin/bash
+# The only root entry point for deploys (audit I-2). Lives in /usr/local/sbin/lending-ctl,
+# owned by root, 0755. In sudoers the deploy user is allowed only the exact command lines
+# from deploy/server/sudoers.lending, without wildcards: sudo checks arguments in full.
+#
+#   lending-ctl slot <start|stop|restart|enable|disable> <blue|green>
+#   lending-ctl switch <blue|green>                upstream nginx + CSP, nginx -t, reload
+#                                                  stdin (optional): CSP_*=value lines
+#   lending-ctl install-env                        stdin: backend.env → /etc/lending/backend.env
+#   lending-ctl install-auth                       stdin: htpasswd line (bcrypt) or empty = no basic auth
+#   lending-ctl install-monitor-token              stdin: MONITOR_TOKEN (32-128 chars [A-Za-z0-9_-]) or empty
+#
+# All input is untrusted: the deploy user is the CI runner.
+set -euo pipefail
+umask 077
+
+ROOT=/opt/lending
+ETC=/etc/lending
+NGINX=/etc/nginx
+
+die() {
+  echo "lending-ctl: $*" >&2
+  exit 2
+}
+slot_arg() { [[ ${1:-} =~ ^(blue|green)$ ]] || die "slot must be blue or green"; }
+port_of() { [ "$1" = blue ] && echo 3001 || echo 3002; }
+# Atomic write: temp file next to the target, permissions, rename
+write_file() { # path mode owner:group; content from stdin
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX")
+  cat >"$tmp"
+  chmod "$2" "$tmp"
+  chown "$3" "$tmp"
+  if [ -f "$1" ]; then cp -p "$1" "$1.prev"; fi
+  mv -f "$tmp" "$1"
+}
+# nginx -t and reload; on error restore the previous file versions, leave the running nginx alone
+nginx_apply() {
+  local f
+  if ! nginx -t -q 2>/dev/null; then
+    for f in "$@"; do if [ -f "$f.prev" ]; then mv -f "$f.prev" "$f"; fi; done
+    die "nginx -t failed with the new config; previous files restored"
+  fi
+  systemctl reload nginx
+}
+
+cmd_slot() {
+  local verb=${1:-} slot=${2:-}
+  [[ $verb =~ ^(start|stop|restart|enable|disable)$ ]] || die "slot verb: start|stop|restart|enable|disable"
+  slot_arg "$slot"
+  exec systemctl "$verb" "lending-backend@$slot.service"
+}
+
+# sha256 of the inline scripts in index.html for CSP script-src (without 'unsafe-inline')
+inline_hashes() {
+  python3 - "$@" <<'PY'
+import base64, hashlib, html.parser, sys
+
+class P(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.inside, self.buf, self.out = False, [], set()
+    def handle_starttag(self, tag, attrs):
+        if tag == "script" and not dict(attrs).get("src"):
+            self.inside, self.buf = True, []
+    def handle_endtag(self, tag):
+        if tag == "script" and self.inside:
+            body = "".join(self.buf).encode()
+            self.out.add("'sha256-" + base64.b64encode(hashlib.sha256(body).digest()).decode() + "'")
+            self.inside = False
+    def handle_data(self, data):
+        if self.inside: self.buf.append(data)
+
+hashes = set()
+for path in sys.argv[1:]:
+    try:
+        p = P()
+        p.feed(open(path, encoding="utf-8").read())
+        hashes |= p.out
+    except FileNotFoundError:
+        pass
+print(" ".join(sorted(hashes)))
+PY
+}
+
+cmd_switch() {
+  local slot=${1:-}
+  slot_arg "$slot"
+  local port new_index cur_index
+  port=$(port_of "$slot")
+  new_index="$(readlink -f "$ROOT/slots/$slot")/frontend/dist/index.html"
+  cur_index="$ROOT/frontend/current/index.html"
+  case "$new_index" in "$ROOT"/releases/*) ;; *) die "slot $slot does not point into $ROOT/releases" ;; esac
+
+  # Extra CSP sources from stdin: CSP_CONNECT_SRC, CSP_IMG_SRC, CSP_FRAME_SRC (space-separated),
+  # CSP_MODE=enforce|report-only. Each source is an https/wss scheme and a host, no quotes and no ';'.
+  local connect="" img="" frame="" mode=enforce line key val src
+  if [ ! -t 0 ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -z "$line" ] && continue
+      key=${line%%=*}
+      val=${line#*=}
+      case "$key" in
+        CSP_MODE)
+          [[ $val =~ ^(enforce|report-only)$ ]] || die "CSP_MODE: enforce|report-only"
+          mode=$val
+          continue
+          ;;
+        CSP_CONNECT_SRC | CSP_IMG_SRC | CSP_FRAME_SRC) ;;
+        *) die "unknown CSP key: $key" ;;
+      esac
+      for src in $val; do
+        [[ $src =~ ^(https|wss)://(\*\.)?[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._/-]*)?$ ]] || die "bad CSP source: $src"
+        case "$key" in
+          CSP_CONNECT_SRC) connect+=" $src" ;;
+          CSP_IMG_SRC) img+=" $src" ;;
+          CSP_FRAME_SRC) frame+=" $src" ;;
+        esac
+      done
+    done
+  fi
+  local hashes csp
+  # hashes of the old and new index.html: between the reload and the symlink swap either one is served
+  hashes=$(inline_hashes "$new_index" "$cur_index")
+  csp="default-src 'self'; script-src 'self'${hashes:+ $hashes}; style-src 'self' 'unsafe-inline'"
+  csp+="; img-src 'self' data: https://info.send.it$img; font-src 'self' data:"
+  csp+="; connect-src 'self'$connect; frame-src 'self'$frame; worker-src 'self'"
+  csp+="; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+  local enforce="" report=""
+  if [ "$mode" = enforce ]; then enforce=$csp; else report=$csp; fi
+
+  rm -f "$NGINX/lending-upstream.conf.prev" "$NGINX/lending-csp.conf.prev"
+  printf 'server 127.0.0.1:%s;\n' "$port" | write_file "$NGINX/lending-upstream.conf" 0644 root:root
+  # shellcheck disable=SC2016 # nginx variables, not shell
+  printf 'set $lending_csp "%s";\nset $lending_csp_report_only "%s";\n' "$enforce" "$report" |
+    write_file "$NGINX/lending-csp.conf" 0644 root:root
+  nginx_apply "$NGINX/lending-upstream.conf" "$NGINX/lending-csp.conf"
+}
+
+# backend.env: only KEY=VALUE lines, keys from the format allowlist, no control characters.
+# systemd (root) reads the file when the unit starts: the backend process does not see it (I-14, I-15).
+cmd_install_env() {
+  local tmp line n=0
+  tmp=$(mktemp)
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line =~ ^[A-Z][A-Z0-9_]{0,63}=[^[:cntrl:]]*$ ]] || {
+      rm -f "$tmp"
+      die "backend.env line $n: expected KEY=VALUE without control characters"
+    }
+    printf '%s\n' "$line" >>"$tmp"
+  done
+  [ "$n" -le 200 ] || die "backend.env: too many lines"
+  install -d -m 0755 -o root -g root "$ETC"
+  write_file "$ETC/backend.env" 0600 root:root <"$tmp"
+  rm -f "$tmp"
+}
+
+# nginx basic auth: one line user:$2y$…(bcrypt) or empty, meaning no password (public TestNet)
+cmd_install_auth() {
+  local line=""
+  IFS= read -r line || true
+  rm -f "$NGINX/lending-auth.conf.prev" "$NGINX/lending.htpasswd.prev"
+  if [ -z "$line" ]; then
+    printf 'auth_basic off;\n' | write_file "$NGINX/lending-auth.conf" 0644 root:root
+  else
+    [[ $line =~ ^[A-Za-z0-9._-]{1,64}:\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$ ]] || die "htpasswd: expected one bcrypt line"
+    printf '%s\n' "$line" | write_file "$NGINX/lending.htpasswd" 0640 root:www-data
+    printf 'auth_basic "Canton Lending demo";\nauth_basic_user_file %s/lending.htpasswd;\n' "$NGINX" |
+      write_file "$NGINX/lending-auth.conf" 0644 root:root
+  fi
+  nginx_apply "$NGINX/lending-auth.conf" "$NGINX/lending.htpasswd"
+}
+
+# External monitor token for /healthz/ready (map in the http context)
+cmd_install_monitor_token() {
+  local tok=""
+  IFS= read -r tok || true
+  # check before writing: a die inside the pipeline would leave a partially written file
+  [ -z "$tok" ] || [[ $tok =~ ^[A-Za-z0-9_-]{32,128}$ ]] || die "MONITOR_TOKEN: 32-128 characters of [A-Za-z0-9_-]"
+  rm -f "$NGINX/lending-monitor.conf.prev"
+  # shellcheck disable=SC2016
+  {
+    echo 'map $http_authorization $lending_monitor_ok {'
+    echo '    default 0;'
+    if [ -n "$tok" ]; then printf '    "Bearer %s" 1;\n' "$tok"; fi
+    echo '}'
+  } | write_file "$NGINX/lending-monitor.conf" 0640 root:www-data
+  nginx_apply "$NGINX/lending-monitor.conf"
+}
+
+[ "$(id -u)" = 0 ] || die "must run as root (sudo)"
+case "${1:-}" in
+  slot) cmd_slot "${2:-}" "${3:-}" ;;
+  switch) cmd_switch "${2:-}" ;;
+  install-env) cmd_install_env ;;
+  install-auth) cmd_install_auth ;;
+  install-monitor-token) cmd_install_monitor_token ;;
+  *) die "usage: see the header of $0" ;;
+esac

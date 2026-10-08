@@ -1,0 +1,35 @@
+{
+  "operator": "__FILL_lending-operator::1220…",
+  "oracle": "__FILL_lending-oracle::1220…",
+  "guardian": "__FILL_guardian (external party, own key)::1220…",
+  "treasury": "__FILL_treasury (external party, own key)::1220…",
+  "backstop": "__FILL_lending-backstop::1220…",
+  "liquidators": ["__FILL_lending-liquidator::1220…"],
+  "usdcx": {
+    "instrument": { "admin": "__FILL_USDCx registry admin::1220…", "id": "__FILL_USDCx" },
+    "transferFactory": "__FILL_TransferFactory contract id from the USDCx registry API",
+    "bootstrapPrice": "1.0"
+  },
+  "cc": {
+    "instrument": { "admin": "__FILL_DSO::1220…", "id": "Amulet" },
+    "transferFactory": "__FILL_contract id ExternalPartyAmuletRules (registry API DSO)",
+    "bootstrapPrice": "0.15"
+  },
+  "cbtc": {
+    "instrument": { "admin": "__FILL_CBTC (BitSafe) registry admin::1220…", "id": "__FILL_CBTC" },
+    "transferFactory": "__FILL_TransferFactory contract id from the CBTC registry API",
+    "bootstrapPrice": "100000.0"
+  },
+  "dso": "__FILL_DSO::1220…",
+  "featuredAppRight": null,
+  "council": [
+    "__FILL_council member 1::1220…",
+    "__FILL_council member 2::1220…",
+    "__FILL_council member 3::1220…"
+  ],
+  "councilThreshold": 2,
+  "councilHostedHere": false,
+  "params": null,
+  "ccMarket": null,
+  "cbtcMarket": null
+}

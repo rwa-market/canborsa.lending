@@ -1,0 +1,19 @@
+# Daily backup (audit I-10, B-11): online copy of the indexer SQLite, deployment.json,
+# ledger tokens. Locally in /var/backups/lending (root, 0700), 14 days; when
+# BACKUP_AGE_RECIPIENT and BACKUP_RCLONE_REMOTE are set in /etc/lending/backup.env, an encrypted offsite copy.
+[Unit]
+Description=Canton Lending: backup indexer DB, deployment and ledger tokens
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/lending/backup.env
+ExecStart=/opt/lending/bin/backup.sh
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/backups/lending /opt/lending/status -/opt/lending/shared/data
+# rclone reads its config: RCLONE_CONFIG=/etc/lending/rclone.conf in backup.env
+ProtectHome=read-only
+PrivateTmp=yes

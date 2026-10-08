@@ -1,0 +1,392 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/space-grotesk';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Space Grotesk Variable', 'Geist Variable', ui-sans-serif, sans-serif;
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  /*
+   * Two radius levels across the app: controls and nested blocks (buttons, fields,
+   * badges, menu items, tooltips, blocks inside cards) get 10px; surfaces (cards,
+   * modals, sheet, figures panel, standalone banners) get 16px. Circles are rounded-full.
+   */
+  --radius-xs: 0.375rem;
+  --radius-sm: var(--radius);
+  --radius-md: var(--radius);
+  --radius-lg: var(--radius);
+  --radius-xl: var(--radius-surface);
+  --radius-2xl: var(--radius-surface);
+  --radius-3xl: var(--radius-surface);
+  --radius-4xl: var(--radius-surface);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-brand: var(--brand);
+  --color-surface: var(--surface);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/*
+ * The theme is shadcn variables only. Graphite + blue: a cool
+ * neutral base, one accent (primary): main buttons, focus, active tab,
+ * links and info banners. Beyond the shadcn set, only position health (HF) tones:
+ * success (ok), warning (warn; warning-foreground is warning text on a card
+ * and on a warning/10..15 tint), bad is destructive.
+ */
+:root {
+  color-scheme: light;
+  --radius: 0.625rem;
+  --radius-surface: 1rem;
+  --background: #f3f5fa;
+  --foreground: #0a1020;
+  --card: #ffffff;
+  --card-foreground: #0a1020;
+  --popover: #ffffff;
+  --popover-foreground: #0a1020;
+  --surface: #f7f9fd;
+  --primary: #1f5eff;
+  --primary-foreground: #ffffff;
+  --brand: #1f5eff;
+  --secondary: #edf1f8;
+  --secondary-foreground: #121a2e;
+  --muted: #eef2f8;
+  --muted-foreground: #525c70;
+  --accent: #e9effb;
+  --accent-foreground: #0a1020;
+  --destructive: #c23b3b;
+  --success: #0f8a5f;
+  --success-foreground: #ffffff;
+  --warning: #c47a0c;
+  --warning-foreground: #8a5300;
+  --border: #dde3ee;
+  --input: #c8d0de;
+  --ring: #1f5eff;
+  --aurora-1: rgb(31 94 255 / 0.2);
+  --aurora-2: rgb(124 77 255 / 0.16);
+  --aurora-3: rgb(56 189 248 / 0.18);
+  --chart-1: #1f5eff;
+  --chart-2: #7a8aa8;
+  --chart-3: #0f8a5f;
+  --chart-4: #c47a0c;
+  --chart-5: #c23b3b;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #0a1020;
+  --sidebar-primary: #1f5eff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e9effb;
+  --sidebar-accent-foreground: #0a1020;
+  --sidebar-border: #dde3ee;
+  --sidebar-ring: #1f5eff;
+}
+
+/* Dark (main): deep ink blue, cards one step lighter, blue accent */
+.dark {
+  color-scheme: dark;
+  --background: #070b14;
+  --foreground: #eef2fa;
+  --card: #0c1220;
+  --card-foreground: #eef2fa;
+  --popover: #111a2c;
+  --popover-foreground: #eef2fa;
+  --surface: #0f1728;
+  --primary: #2563ff;
+  --primary-foreground: #ffffff;
+  --brand: #6b9bff;
+  --secondary: #131c30;
+  --secondary-foreground: #e2e8f4;
+  --muted: #121a2b;
+  --muted-foreground: #93a0b8;
+  --accent: #16203a;
+  --accent-foreground: #eef2fa;
+  --destructive: #ef7474;
+  --success: #3fd39a;
+  --success-foreground: #04130d;
+  --warning: #eeb244;
+  --warning-foreground: #eeb244;
+  --border: #1c2740;
+  --input: #26324f;
+  --ring: #6b9bff;
+  --aurora-1: rgb(37 99 255 / 0.5);
+  --aurora-2: rgb(124 77 255 / 0.4);
+  --aurora-3: rgb(56 189 248 / 0.32);
+  --chart-1: #6b9bff;
+  --chart-2: #8b93a5;
+  --chart-3: #3fd39a;
+  --chart-4: #eeb244;
+  --chart-5: #ef7474;
+  --sidebar: #0a0f1c;
+  --sidebar-foreground: #e2e8f4;
+  --sidebar-primary: #2563ff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #16203a;
+  --sidebar-accent-foreground: #eef2fa;
+  --sidebar-border: #1c2740;
+  --sidebar-ring: #6b9bff;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer base {
+  body {
+    font-feature-settings:
+      'tnum' 1,
+      'lnum' 1;
+  }
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.025em;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 28%, transparent);
+  }
+  input {
+    caret-color: var(--primary);
+  }
+  html {
+    scrollbar-color: color-mix(in oklab, var(--muted-foreground) 40%, transparent) transparent;
+    /* The sticky header does not cover the focused element or the scroll target (WCAG 2.4.11) */
+    scroll-padding-top: 5rem;
+  }
+  /* Pointer on everything clickable; a normal cursor on disabled ones */
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']),
+  [role='tab'],
+  [role='radio'],
+  [role='option'],
+  [role='combobox'],
+  label[for],
+  summary,
+  a[href] {
+    cursor: pointer;
+  }
+  /* Theme switch without flashing transitions */
+  .theme-switching *,
+  .theme-switching *::before,
+  .theme-switching *::after {
+    transition: none !important;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-rise {
+  animation: rise 0.6s var(--ease-spring) both;
+}
+/* Staggered entrance: sections rise one after another, not as one block */
+.rise-stagger > * {
+  animation: rise 0.6s var(--ease-spring) both;
+}
+.rise-stagger > :nth-child(2) {
+  animation-delay: 60ms;
+}
+.rise-stagger > :nth-child(3) {
+  animation-delay: 120ms;
+}
+.rise-stagger > :nth-child(4) {
+  animation-delay: 180ms;
+}
+.rise-stagger > :nth-child(n + 5) {
+  animation-delay: 240ms;
+}
+/* Form content change on tab switch */
+@keyframes swap-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.animate-swap {
+  animation: swap-in 0.28s var(--ease-spring) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .animate-rise,
+  .rise-stagger > *,
+  .animate-swap,
+  .live-dot,
+  .page-top::before,
+  .page-top::after {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0ms !important;
+  }
+}
+
+/*
+ * Page title bar: slowly flowing gradients (cobalt, the logo's violet,
+ * light blue). Only the pseudo-elements' transform moves, no text repaint; with
+ * prefers-reduced-motion the background is static.
+ */
+.page-top {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: var(--card);
+}
+.page-top::before,
+.page-top::after {
+  content: '';
+  position: absolute;
+  inset: -50% -15%;
+  z-index: -1;
+  pointer-events: none;
+  will-change: transform;
+}
+.page-top::before {
+  background:
+    radial-gradient(28% 70% at 8% 40%, var(--aurora-1), transparent 72%),
+    radial-gradient(30% 75% at 46% 70%, var(--aurora-2), transparent 72%),
+    radial-gradient(28% 70% at 88% 35%, var(--aurora-1), transparent 72%);
+  animation: aurora-a 26s ease-in-out infinite alternate;
+}
+.page-top::after {
+  background:
+    radial-gradient(26% 65% at 28% 25%, var(--aurora-3), transparent 72%),
+    radial-gradient(26% 65% at 70% 55%, var(--aurora-2), transparent 72%);
+  animation: aurora-b 34s ease-in-out infinite alternate;
+}
+@keyframes aurora-a {
+  0% {
+    transform: translate3d(-10%, -6%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(8%, 6%, 0) scale(1.15);
+  }
+  100% {
+    transform: translate3d(-4%, 8%, 0) scale(1.05);
+  }
+}
+@keyframes aurora-b {
+  0% {
+    transform: translate3d(12%, 6%, 0) scale(1.1);
+  }
+  50% {
+    transform: translate3d(-10%, -4%, 0) scale(0.92);
+  }
+  100% {
+    transform: translate3d(5%, -8%, 0) scale(1.18);
+  }
+}
+
+/* Live network status: the dot pulses while the node is online */
+@keyframes live-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--success) 55%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 6px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+.live-dot {
+  animation: live-pulse 2.4s ease-out infinite;
+}
+
+/* Loop SDK sign-in dialog: the old-wallet switch leads to wallet.devnet.looptech.io, where Google
+   sign-in fails (wallet/loop.ts, walletUrls) */
+.loop-connect .switch-link {
+  display: none;
+}
+
+/* "Skip to content" link: visible only on keyboard focus */
+.skip-link {
+  position: fixed;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 60;
+  translate: 0 -200%;
+  border-radius: 9999px;
+  background: var(--foreground);
+  color: var(--background);
+  padding: 0.625rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+.skip-link:focus-visible {
+  translate: 0 0;
+}
+
+/* High contrast mode: bar fills must not disappear along with the background */
+@media (forced-colors: active) {
+  [data-slot='meter-fill'],
+  [data-slot='meter-marker'] {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+  [role='meter'],
+  [data-slot='meter-track'] {
+    border: 1px solid CanvasText;
+  }
+}

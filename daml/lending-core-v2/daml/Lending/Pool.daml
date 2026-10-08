@@ -1,0 +1,830 @@
+-- | USDCx pool, Compound V3 model (docs/requirements/compound-v3-migration).
+-- All user operations are choices on `Pool` with the user as controller: the body has the authority
+-- of both the user and the operator, so token transfers and state changes go in one transaction
+-- (ADR-001, D2).
+--
+-- Each account has one USDCx balance (positive: deposit, negative: debt) backed by all of its
+-- collateral. Four user operations: supply and withdraw USDCx (a withdrawal becomes a loan only with
+-- allowBorrow), supply and withdraw collateral. An undercollateralized account is absorbed by the
+-- operator (Pool_Absorb): its collateral goes to the protocol and its balance is credited, no tokens
+-- move. Approved buyers then buy the collateral at a discount (Pool_BuyCollateral).
+--
+-- The pool is signed only by the operator and has no observers: user balances are visible only to
+-- the operator (audit V1). Parameters, roles and trusted factories live in ProtocolConfig and are
+-- changed by the council; pause flags live in PauseState (Lending.Pause).
+module Lending.Pool where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Either (isRight)
+import DA.TextMap qualified as TextMap
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.MetadataV1 (Metadata (..))
+import Splice.Api.Token.TransferInstructionV1 (TransferInstruction, TransferInstructionResult_Output (..))
+
+import Lending.Account
+import Lending.Config
+import Lending.Evm
+import Lending.EvmRedeem
+import Lending.Loop
+import Lending.Math
+import Lending.Oracle
+import Lending.Pause
+import Lending.Rates
+import Lending.Rewards
+import Lending.Risk
+import Lending.Token
+import Lending.Types
+
+-- | Price contracts for an operation (K3): a feed for every collateral asset the account holds,
+-- the USDCx feed and the reserve attestations. Feeds that are missing count the asset as zero for
+-- a borrow and a collateral withdrawal; an absorb needs all of them.
+data PriceArgs = PriceArgs
+  with
+    collateralFeedCids : [ContractId PriceFeed]
+    debtFeedCid : Optional (ContractId PriceFeed)
+    attestationCids : [ContractId ReserveAttestation]
+  deriving (Eq, Show)
+
+noPrices : PriceArgs
+noPrices = PriceArgs with collateralFeedCids = []; debtFeedCid = None; attestationCids = []
+
+template Pool
+  with
+    operator : Party
+    governors : [Party]
+      -- ^ council that must sign this pool's config
+    markets : Map MarketId Market
+    state : PoolState
+  where
+    signatory operator
+    ensure state.cash >= 0.0 && state.totalSupplyPrincipal >= 0.0 && state.totalBorrowPrincipal >= 0.0
+      && all (\m -> m.totalCollateral >= 0.0 && m.protocolCollateral >= 0.0 && m.protocolCollateralBasis >= 0.0)
+           (Map.values markets)
+
+    -- Canton party users (K2) ----------------------------------------------------------
+    -- Operation bodies are the functions below: Pool_EvmExecute and Pool_LoopWalletExecute run the
+    -- same ones for accounts under a custodian.
+
+    -- | Supply USDCx: repays the debt first, the rest is a deposit. Never paused (§11).
+    choice Pool_SupplyBase : (ContractId Pool, ContractId Account)
+      with
+        user : Party
+        configCid : ContractId ProtocolConfig
+        accountCid : ContractId Account
+        amount : Decimal
+          -- ^ with full: the cap the user is willing to pay
+        full : Bool
+          -- ^ repay the whole debt: the amount is the debt rounded up, the balance becomes exactly 0
+        payment : TransferArgs
+      controller user
+      do
+        config <- loadConfig this configCid
+        dropMoved <$> supplyBaseWith this config user accountCid (fetchAccount operator user accountCid) amount full payment
+
+    -- | Withdraw USDCx: the deposit first; below zero only with allowBorrow, then it is a loan.
+    choice Pool_WithdrawBase : (ContractId Pool, ContractId Account)
+      with
+        user : Party
+        configCid : ContractId ProtocolConfig
+        pauseCid : ContractId PauseState
+        accountCid : ContractId Account
+        amount : Decimal
+        full : Bool
+          -- ^ withdraw the whole deposit (rounded down); the balance becomes exactly 0
+        allowBorrow : Bool
+          -- ^ False: rejected if the balance would go below 0 (risk 7)
+        prices : PriceArgs
+          -- ^ for a borrow: every collateral feed, the USDCx feed, attestations
+        payout : TransferArgs
+      controller user
+      do
+        config <- loadConfig this configCid
+        dropMoved <$> withdrawBaseWith this config pauseCid user accountCid (fetchAccount operator user accountCid) amount full allowBorrow prices payout
+
+    -- | Supply collateral. No price is needed and it is never paused (§11).
+    choice Pool_SupplyCollateral : (ContractId Pool, ContractId Account)
+      with
+        user : Party
+        configCid : ContractId ProtocolConfig
+        accountCid : ContractId Account
+        marketId : MarketId
+        amount : Decimal
+        payment : TransferArgs
+      controller user
+      do
+        config <- loadConfig this configCid
+        dropMoved <$> supplyCollateralWith this config user accountCid (fetchAccount operator user accountCid) marketId amount payment
+
+    choice Pool_WithdrawCollateral : (ContractId Pool, ContractId Account)
+      with
+        user : Party
+        configCid : ContractId ProtocolConfig
+        pauseCid : ContractId PauseState
+        accountCid : ContractId Account
+        marketId : MarketId
+        amount : Decimal
+        prices : PriceArgs
+          -- ^ with debt: every collateral feed and the USDCx feed
+        payout : TransferArgs
+      controller user
+      do
+        config <- loadConfig this configCid
+        dropMoved <$> withdrawCollateralWith this config pauseCid user accountCid (fetchAccount operator user accountCid) marketId amount prices payout
+
+    -- EVM user's account (0.5.0, ADR-004) -----------------------------------------------
+
+    -- | Operation on an EVM user's account with their wallet signature. The contract builds the
+    -- message from the arguments, checks the signature and nonce, executes the same operation as the
+    -- regular choice, and moves the amount between the wallet balance and the account.
+    choice Pool_EvmExecute : (ContractId Pool, ContractId Account, ContractId EvmWallet)
+      with
+        custody : Party
+        configCid : ContractId ProtocolConfig
+        pauseCid : ContractId PauseState
+        walletCid : ContractId EvmWallet
+        accountCid : ContractId Account
+        action : EvmAction
+        signature : EvmSignature
+        prices : PriceArgs
+        transfer : TransferArgs
+          -- ^ custodian holdings (payment) or operator holdings (payout)
+      controller custody
+      do
+        config <- loadConfig this configCid
+        let debt = config.params.debtInstrument
+        wallet <- consumeEvmSignature operator custody walletCid (actionLine debt.id action) signature
+        case action of
+          EvmTransferOut{} -> abort "transfer out goes through Pool_EvmWalletExecute"
+          EvmRedeem{} -> abort "redeem goes through Pool_EvmWalletExecute"
+          _ -> pure ()
+        (poolCid, accountCid', balances) <- executePoolOp this config pauseCid custody accountCid
+          (fetchEvmAccount operator custody wallet.address accountCid) debit action wallet.balances prices transfer
+        walletCid' <- create wallet with balances
+        pure (poolCid, accountCid', walletCid')
+
+    -- | Withdrawal from the EVM wallet balance (0.6.0, real assets) with the wallet signature. The
+    -- pool does not change (nonconsuming).
+    --   EvmTransferOut: transfer of the custodian's holdings to a Canton party through the trusted
+    --     ProtocolConfig factory; Pending: the instruction waits for the receiver, its cid is in the result.
+    --   EvmRedeem: debit USDCx and open a RedeemRequest for a burn in xReserve.
+    nonconsuming choice Pool_EvmWalletExecute
+      : (ContractId EvmWallet, Optional (ContractId TransferInstruction), Optional (ContractId RedeemRequest))
+      with
+        custody : Party
+        configCid : ContractId ProtocolConfig
+        walletCid : ContractId EvmWallet
+        action : EvmAction
+        signature : EvmSignature
+        transfer : Optional TransferArgs
+          -- ^ EvmTransferOut: custodian holdings. EvmRedeem: None
+      controller custody
+      do
+        config <- loadConfig this configCid
+        let debt = config.params.debtInstrument
+        -- arguments before the signature: a rejection does not spend the nonce
+        case action of
+          EvmTransferOut with amount; receiver -> do
+            require "amount must be positive" (amount > 0.0)
+            require "receiver must not be the custody party" (receiver /= custody)
+            require "transfer arguments required" (transfer /= None)
+          EvmRedeem with amount; ethAddress; requestId -> do
+            require "amount must be positive" (amount > 0.0)
+            require "redeem amount must have at most 6 decimal places" (roundCommercial redeemDecimals amount == amount)
+            require "not a lowercase 0x Ethereum address" (isEvmAddress ethAddress)
+            require "request id required" (requestId /= "")
+            require "redeem takes no transfer arguments" (transfer == None)
+          _ -> abort "pool operations go through Pool_EvmExecute"
+        wallet <- consumeEvmSignature operator custody walletCid (actionLine debt.id action) signature
+        case action of
+          EvmTransferOut with instrumentId; amount; receiver -> do
+            args <- optional (abort "transfer arguments required") pure transfer
+            balances <- debit instrumentId amount wallet.balances
+            let meta = Metadata with values = TextMap.fromList [(depositReasonKey, evmDepositReason wallet.address)]
+            output <- transferOut config.transferFactories instrumentId custody receiver amount meta args
+            walletCid' <- create wallet with balances
+            pure (walletCid', pendingOf output, None)
+          EvmRedeem with amount; ethAddress; requestId -> do
+            balances <- debit debt amount wallet.balances
+            now <- getTime
+            requestCid <- create RedeemRequest with
+              operator; custody; address = wallet.address; instrumentId = debt; amount
+              ethAddress; requestId; createdAt = now
+            walletCid' <- create wallet with balances
+            pure (walletCid', None, Some requestCid)
+          _ -> abort "unreachable: arguments checked above"
+
+    -- Loop user's account (0.7.0, Lending.Loop) -------------------------------------------
+
+    -- | Any operation on a Loop account with the user's signature: the four pool operations and
+    -- withdrawal to a Canton party (EvmTransferOut). EvmRedeem is closed for Loop.
+    --
+    -- THE Ed25519 SIGNATURE IS NOT CHECKED HERE: Daml 3.5 has no Ed25519. The custodian's backend
+    -- checks it before sending the command against LoopWallet.publicKey and signedMessage. The
+    -- contract checks the nonce, the expiry and that signedMessage is exactly this operation's text.
+    --
+    -- Nonconsuming: a withdrawal does not change the pool. Pool operations archive the pool themselves.
+    -- Result: (new pool, new Account, new LoopWallet, pending withdrawal instruction).
+    nonconsuming choice Pool_LoopWalletExecute
+      : (Optional (ContractId Pool), Optional (ContractId Account), ContractId LoopWallet, Optional (ContractId TransferInstruction))
+      with
+        custody : Party
+        configCid : ContractId ProtocolConfig
+        pauseCid : ContractId PauseState
+        walletCid : ContractId LoopWallet
+        accountCid : Optional (ContractId Account)
+          -- ^ Loop account: required for pool operations, None for EvmTransferOut
+        action : EvmAction
+        signedMessage : Text
+        signature : Text
+        nonce : Int
+        expiresAt : Time
+        prices : PriceArgs
+        transfer : Optional TransferArgs
+      controller custody
+      do
+        config <- loadConfig this configCid
+        let debt = config.params.debtInstrument
+        case action of
+          EvmTransferOut with amount; receiver -> do
+            require "amount must be positive" (amount > 0.0)
+            require "receiver must not be the custody party" (receiver /= custody)
+            require "transfer arguments required" (transfer /= None)
+          EvmRedeem{} -> abort "redeem to Ethereum is not available for Loop wallets"
+          _ -> do
+            require "account required" (accountCid /= None)
+            require "transfer arguments required" (transfer /= None)
+        wallet <- consumeLoopSignature operator custody walletCid (actionLine debt.id action)
+          signedMessage signature nonce expiresAt
+        let required name = optional (abort (name <> " required")) pure
+        case action of
+          EvmTransferOut with instrumentId; amount; receiver -> do
+            args <- required "transfer arguments" transfer
+            balances <- debitLoop instrumentId amount wallet.balances
+            let meta = Metadata with values = TextMap.fromList [(depositReasonKey, loopDepositReason wallet.party)]
+            output <- transferOut config.transferFactories instrumentId custody receiver amount meta args
+            walletCid' <- create wallet with balances
+            pure (None, None, walletCid', pendingOf output)
+          _ -> do
+            cid <- required "account" accountCid
+            args <- required "transfer arguments" transfer
+            archive self
+            (poolCid, accountCid', balances) <- executePoolOp this config pauseCid custody cid
+              (fetchLoopAccount operator custody wallet.party cid) debitLoop action wallet.balances prices args
+            walletCid' <- create wallet with balances
+            pure (Some poolCid, Some accountCid', walletCid', None)
+
+    -- Absorb and collateral sale (K5) ----------------------------------------------------
+
+    -- | Absorb an undercollateralized account (absorb). Called by the operator: only it sees the
+    -- account. All collateral goes to the protocol and the account is credited with its value at the
+    -- quote midpoint × liquidationFactor. A positive result stays as a deposit; a negative one is
+    -- zeroed and the difference is bad debt, which lowers reserves. No tokens move.
+    choice Pool_Absorb : (ContractId Pool, ContractId Account)
+      with
+        configCid : ContractId ProtocolConfig
+        pauseCid : ContractId PauseState
+        accountCid : ContractId Account
+        prices : PriceArgs
+          -- ^ a feed for every collateral asset of the account and the USDCx feed
+      controller operator
+      do
+        config <- loadConfig this configCid
+        flags <- loadPause operator config pauseCid
+        require "absorb paused" (not flags.absorbPaused)
+        account <- fetch accountCid
+        require "account belongs to another operator" (account.operator == operator)
+        require "account has no debt" (account.principal < 0.0)
+        s <- accrueNow config state
+        now <- getTime
+        let params = config.params
+        feeds <- loadFeeds config prices.collateralFeedCids
+        debtFeed <- loadDebtFeed config prices
+        debtPrice <- requireE (validLiquidationPrice params now DebtSide debtFeed)
+        let debtMid = midPrice debtFeed
+        held <- forA (heldCollateral account.collateral) \(marketId, amount) -> do
+          mp <- marketParamsOf config marketId
+          feed <- case Map.lookup mp.collateralInstrument feeds of
+            None -> abort ("price feed required for collateral " <> marketId)
+            Some f -> pure f
+          lo <- requireE (validLiquidationPrice params now CollateralSide feed)
+          let line = CollateralLine with marketId; amount; params = mp; price = Some lo; attested = True
+          pure (line, midPrice feed)
+        point <- requireE (liquidationPoint (map fst held))
+        let debt = presentDebt s (negate account.principal)
+        -- the trigger is the lower collateral quote and the higher USDCx quote: conservative
+        require "account is not liquidatable" (mulUp debt debtPrice > point)
+        let credits = [ (l.marketId, l.amount, divDown (mulDown (mulDown l.amount mid) l.params.liquidationFactor) debtMid)
+                      | (l, mid) <- held ]
+            credited = sum [ c | (_, _, c) <- credits ]
+            balance = credited - debt
+            newPrincipal = if balance >= 0.0 then principalValue s balance else 0.0
+            s' = applyPrincipal s account.principal newPrincipal
+        markets' <- foldlA (\acc (marketId, amount, credit) -> do
+            m <- getMarket acc marketId
+            pure (Map.insert marketId (m with
+              totalCollateral = m.totalCollateral - amount
+              protocolCollateral = m.protocolCollateral + amount
+              protocolCollateralBasis = m.protocolCollateralBasis + credit) acc))
+          markets credits
+        accountCid' <- replaceAccount accountCid account with principal = newPrincipal; collateral = Map.empty
+        poolCid <- create this with state = s'; markets = markets'
+        pure (poolCid, accountCid')
+
+    -- | Buy absorbed collateral (buyCollateral, quoteCollateral). Only approved buyers (liquidators,
+    -- backstop); the buyer never learns whose position it was. Price: midpoint × (1 −
+    -- storeFrontPriceFactor × (1 − liquidationFactor)). For sale while reserves are below target.
+    -- Payment and collateral go in one transaction.
+    choice Pool_BuyCollateral : (ContractId Pool, Decimal)
+      with
+        buyer : Party
+        configCid : ContractId ProtocolConfig
+        pauseCid : ContractId PauseState
+        marketId : MarketId
+        amount : Decimal
+          -- ^ USDCx the buyer pays
+        minCollateral : Decimal
+          -- ^ the purchase is rejected if it gives less collateral than this
+        collateralFeedCid : ContractId PriceFeed
+        debtFeedCid : ContractId PriceFeed
+        payment : TransferArgs
+          -- ^ the buyer's USDCx holdings
+        payout : TransferArgs
+          -- ^ the operator's collateral holdings
+      controller buyer
+      do
+        config <- loadConfig this configCid
+        let params = config.params
+        flags <- loadPause operator config pauseCid
+        require "collateral purchase paused" (not flags.buyPaused)
+        require "buyer is not approved" (buyer `elem` buyers config.roles)
+        require "amount must be positive" (amount > 0.0)
+        s <- accrueNow config state
+        require "collateral not for sale: reserves at target" (reserves s < params.targetReserves)
+        market <- getMarket markets marketId
+        mp <- marketParamsOf config marketId
+        now <- getTime
+        collateralFeed <- fetch collateralFeedCid
+        requireE (checkFeed config.roles.oracle mp.collateralInstrument collateralFeed)
+        _ <- requireE (validLiquidationPrice params now CollateralSide collateralFeed)
+        debtFeed <- fetch debtFeedCid
+        requireE (checkFeed config.roles.oracle params.debtInstrument debtFeed)
+        _ <- requireE (validLiquidationPrice params now DebtSide debtFeed)
+        let price = discountedPrice params mp (midPrice collateralFeed)
+            debtMid = midPrice debtFeed
+            stock = market.protocolCollateral
+            -- 1.0.2: USDCx for the whole stock, rounded up. Paying it buys the whole stock exactly:
+            -- floor(amount / price) alone leaves a rest of one token unit that nobody can buy
+            -- (0.0000000001 CBTC costs less than one USDCx unit), and stock blocks a delisting
+            wholeCost = divUp (mulUp stock price) debtMid
+            whole = toN amount >= wholeCost
+            bought = floorDecimal (divDown (mulDown (toN amount) debtMid) price)
+            -- 1.0.1: a rest cheaper than the smallest USDCx unit goes with the purchase
+            rest = stock - toN bought
+            dust = rest > 0.0 && divDown (mulDown rest price) debtMid < 0.0000000001
+            all = whole || dust
+            out = if all then floorDecimal stock else bought
+            sold = if all then stock else toN out
+        require "pays more than the whole stock costs" (amount <= ceilDecimal wholeCost)
+        -- every USDCx operation is at least 1, except one that clears the stock (audit L4)
+        require "a purchase is at least 1 USDCx unless it takes the whole stock" (amount >= 1.0 || all)
+        require "nothing to buy" (out > 0.0)
+        require "collateral received below the minimum" (out >= minCollateral)
+        require "not enough collateral for sale" (sold <= market.protocolCollateral)
+        _ <- transferNow config.transferFactories params.debtInstrument buyer operator amount payment
+        _ <- transferNow config.transferFactories mp.collateralInstrument operator buyer out payout
+        let left = market.protocolCollateral - sold
+            -- the book value goes down in proportion, rounded up: losses are not hidden
+            basis = if left <= 0.0 then 0.0
+                    else maxN 0.0 (market.protocolCollateralBasis
+                      - mulUp market.protocolCollateralBasis (divUp sold market.protocolCollateral))
+        recordActivity operator config.dso config.featuredAppRight
+        poolCid <- create this with
+          state = s with cash = s.cash + toN amount
+          markets = Map.insert marketId (market with protocolCollateral = left; protocolCollateralBasis = basis) markets
+        pure (poolCid, out)
+
+    -- Reserves (K6) ---------------------------------------------------------------------
+
+    -- | Treasury adds USDCx to cash: starting reserves and recapitalization.
+    choice Pool_AddReserves : ContractId Pool
+      with
+        actor : Party
+        configCid : ContractId ProtocolConfig
+        amount : Decimal
+        payment : TransferArgs
+      controller actor
+      do
+        config <- loadConfig this configCid
+        require "only treasury can add reserves" (actor == config.roles.treasury)
+        require "amount must be positive" (amount > 0.0)
+        s <- accrueNow config state
+        _ <- transferNow config.transferFactories config.params.debtInstrument actor operator amount payment
+        create this with state = s with cash = s.cash + toN amount
+
+    -- | Withdraw reserves to treasury (withdrawReserves): only non-negative reserves and at most them.
+    -- Needs the authority of the operator, treasury and the council: an executed IncomeProposal.
+    choice Pool_WithdrawReserves : ContractId Pool
+      with
+        treasury : Party
+        configCid : ContractId ProtocolConfig
+        amount : Decimal
+        payout : TransferArgs
+      controller operator :: treasury :: governors
+      do
+        config <- loadConfig this configCid
+        require "reserves are withdrawn only under a council" (not (null governors))
+        require "only treasury receives reserves" (treasury == config.roles.treasury)
+        require "amount must be positive" (amount > 0.0)
+        s <- accrueNow config state
+        let r = reserves s
+        require "reserves are negative" (r >= 0.0)
+        require "amount exceeds reserves" (toN amount <= r)
+        require "insufficient pool liquidity" (toN amount <= s.cash)
+        _ <- transferNow config.transferFactories config.params.debtInstrument operator treasury amount payout
+        create this with state = s with cash = s.cash - toN amount
+
+    -- Administration ------------------------------------------------------------------
+
+    choice Pool_Accrue : ContractId Pool
+      with
+        configCid : ContractId ProtocolConfig
+      controller operator
+      do
+        config <- loadConfig this configCid
+        s <- accrueNow config state
+        create this with state = s
+
+    -- | New collateral asset: only together with Config_AddMarket (MarketListing_Execute).
+    choice Pool_AddMarket : ContractId Pool
+      with
+        marketId : MarketId
+      controller operator :: governors
+      do
+        require "market already listed" (not (Map.member marketId markets))
+        create this with markets = Map.insert marketId newMarket markets
+
+    -- | Remove a collateral asset: only together with Config_RemoveMarket (Delisting_Execute).
+    -- Absorbed collateral must be sold and users must have withdrawn theirs first: nothing is
+    -- written off (1.0.2).
+    choice Pool_RemoveMarket : ContractId Pool
+      with
+        marketId : MarketId
+      controller operator :: governors
+      do
+        require "a market is removed only under a council" (not (null governors))
+        market <- getMarket markets marketId
+        require "absorbed collateral not sold: it cannot be removed" (market.protocolCollateral <= 0.0)
+        -- 1.0.2 (audit H1): a market goes only once users withdrew their collateral. Collateral of a
+        -- removed market would be stale: unvalued for borrows, blocking absorb, and paid out of
+        -- other users' tokens after a re-listing
+        require "users still hold collateral of this market: they withdraw it first" (market.totalCollateral <= 0.0)
+        create this with markets = Map.delete marketId markets
+
+    -- | Bind the pool to the council membership. Called by Council_Adopt and Rotation_Execute with
+    -- the config change. Audit A-3: needs the authority of the current and the new council.
+    choice Pool_SetGovernors : ContractId Pool
+      with
+        newGovernors : [Party]
+      controller operator :: governors <> newGovernors
+      do create this with governors = newGovernors
+
+-- User operations -------------------------------------------------------------------------
+-- Return the new pool, the new account and the amount moved in tokens: Pool_EvmExecute and
+-- Pool_LoopWalletExecute move it between the wallet balance and the account. `fetchAcc` checks the
+-- owner: fetchAccount for a Canton party, fetchEvmAccount, fetchLoopAccount.
+
+type Moved = (ContractId Pool, ContractId Account, Decimal)
+
+dropMoved : Moved -> (ContractId Pool, ContractId Account)
+dropMoved (p, a, _) = (p, a)
+
+-- | Pool operation on an account under the custodian (EVM, Loop): the same function as the regular
+-- choice, and the amount moves between the wallet balance and the account. `debitW` debits the wallet.
+executePoolOp
+  : Pool -> ProtocolConfig -> ContractId PauseState -> Party -> ContractId Account -> Update Account
+  -> (InstrumentId -> Decimal -> Map InstrumentId Decimal -> Update (Map InstrumentId Decimal))
+  -> EvmAction -> Map InstrumentId Decimal -> PriceArgs -> TransferArgs
+  -> Update (ContractId Pool, ContractId Account, Map InstrumentId Decimal)
+executePoolOp pool config pauseCid custody accountCid account debitW action balances prices transfer = do
+  let debt = config.params.debtInstrument
+  case action of
+    EvmSupply with amount; full
+      | full -> do
+          -- the contract computes the debt; that is what leaves the wallet
+          (p, a, paid) <- supplyBaseWith pool config custody accountCid account amount True transfer
+          b <- debitW debt paid balances
+          pure (p, a, b)
+      | otherwise -> do
+          b <- debitW debt amount balances
+          (p, a, _) <- supplyBaseWith pool config custody accountCid account amount False transfer
+          pure (p, a, b)
+    EvmWithdraw with amount; full -> do
+      (p, a, paid) <- withdrawBaseWith pool config pauseCid custody accountCid account amount full False prices transfer
+      pure (p, a, credit debt paid balances)
+    EvmBorrow with amount -> do
+      (p, a, paid) <- withdrawBaseWith pool config pauseCid custody accountCid account amount False True prices transfer
+      pure (p, a, credit debt paid balances)
+    EvmDepositCollateral with marketId; amount -> do
+      mp <- marketParamsOf config marketId
+      b <- debitW mp.collateralInstrument amount balances
+      (p, a, _) <- supplyCollateralWith pool config custody accountCid account marketId amount transfer
+      pure (p, a, b)
+    EvmWithdrawCollateral with marketId; amount -> do
+      mp <- marketParamsOf config marketId
+      (p, a, out) <- withdrawCollateralWith pool config pauseCid custody accountCid account marketId amount prices transfer
+      pure (p, a, credit mp.collateralInstrument out balances)
+    _ -> abort "not a pool operation"
+
+-- | Supply USDCx (supplyBase): the balance grows by the amount; with full the debt is repaid
+-- exactly and the rounding surplus stays in reserves.
+supplyBaseWith : Pool -> ProtocolConfig -> Party -> ContractId Account -> Update Account -> Decimal -> Bool -> TransferArgs -> Update Moved
+supplyBaseWith pool config user accountCid fetchAcc amount full payment = do
+  require "amount must be positive" (amount > 0.0)
+  account <- fetchAcc
+  s <- accrueNow config pool.state
+  let old = account.principal
+      present = presentValue s old
+  (paid, newPrincipal) <- if full
+    then do
+      require "no debt to repay" (old < 0.0)
+      let owed = ceilDecimal (negate present)
+      require "debt exceeds the repay bound: raise amount" (owed <= amount)
+      pure (owed, 0.0)
+    else do
+      require "amount below minimum operation" (toN amount >= minOperationAmount)
+      pure (amount, principalValue s (present + toN amount))
+  _ <- transferNow config.transferFactories config.params.debtInstrument user pool.operator paid payment
+  accountCid' <- replaceAccount accountCid account with principal = newPrincipal
+  let s' = applyPrincipal s old newPrincipal
+  poolCid <- create pool with state = s' with cash = s'.cash + toN paid
+  recordActivity pool.operator config.dso config.featuredAppRight
+  pure (poolCid, accountCid', paid)
+
+-- | Withdraw USDCx (withdrawBase): the deposit first, a debt only with allowBorrow. A borrow is
+-- checked on the debt after the operation: minimum loan, per-user and pool caps, collateral,
+-- utilization ceiling, USDCx peg.
+withdrawBaseWith
+  : Pool -> ProtocolConfig -> ContractId PauseState -> Party -> ContractId Account -> Update Account
+  -> Decimal -> Bool -> Bool -> PriceArgs -> TransferArgs -> Update Moved
+withdrawBaseWith pool config pauseCid user accountCid fetchAcc amount full allowBorrow prices payout = do
+  let params = config.params
+  require "amount must be positive" (amount > 0.0)
+  flags <- loadPause pool.operator config pauseCid
+  account <- fetchAcc
+  s <- accrueNow config pool.state
+  let old = account.principal
+      present = presentValue s old
+  (paid, newPrincipal) <- if full
+    then do
+      require "no deposit to withdraw" (old > 0.0)
+      pure (floorDecimal present, 0.0)
+    else do
+      require "amount below minimum operation" (toN amount >= minOperationAmount)
+      pure (amount, principalValue s (present - toN amount))
+  require "nothing to withdraw" (paid > 0.0)
+  require "insufficient pool liquidity" (toN paid <= s.cash)
+  -- K6: while net reserves are negative, losses are not spread onto suppliers by the first withdrawers
+  require "reserves are negative: withdrawals and loans wait for recapitalization" (netReserves s pool.markets >= 0.0)
+  when (old > 0.0) (require "deposit withdrawals paused" (not flags.supplyWithdrawPaused))
+  let moved = applyPrincipal s old newPrincipal
+      s' = moved with cash = moved.cash - toN paid
+  when (newPrincipal < 0.0) do
+    require "withdrawal exceeds the deposit: borrow explicitly" allowBorrow
+    require "borrowing paused" (not flags.borrowPaused)
+    -- 1.0.3 (review 03.10, item 1): the limits compare the intended debt, the balance before minus
+    -- the amount. The stored principal rounds up and its present value rounds up again, so a borrow
+    -- of exactly the limit was rejected by 1e-18 as soon as the debt index left 1. The rounding stays
+    -- in the protocol's favour in the principal; it only stops deciding the limits.
+    let debt = negate (present - toN paid)
+        rounding = maxN 0.0 (presentDebt s' (negate newPrincipal) - debt)
+        poolDebt = totalDebt s' - rounding
+    require "debt below minimum loan" (debt >= params.minLoan)
+    require "max debt per user exceeded" (debt <= params.maxDebtPerUser)
+    require "total borrow cap exceeded" (poolDebt <= params.totalBorrowCap)
+    require "max utilization exceeded"
+      (utilization poolDebt (totalSupply s') <= params.rateModel.maxUtilization)
+    now <- getTime
+    debtFeed <- loadDebtFeed config prices
+    debtPrice <- requireE (validPrice params now DebtSide debtFeed)
+    requireE (checkDebtPeg params debtPrice)
+    lines <- borrowLines config now prices account.collateral
+    -- 1.0.2: the debt is valued at no less than 1 USD, as for a collateral withdrawal (audit L2):
+    -- otherwise a borrow at a 0.98 quote leaves an account no collateral withdrawal accepts
+    require "not enough collateral for the loan" (mulUp debt (maxN debtPrice 1.0) <= borrowCapacity lines)
+  _ <- transferNow config.transferFactories params.debtInstrument pool.operator user paid payout
+  accountCid' <- replaceAccount accountCid account with principal = newPrincipal
+  poolCid <- create pool with state = s'
+  recordActivity pool.operator config.dso config.featuredAppRight
+  pure (poolCid, accountCid', paid)
+
+-- | Supply collateral (supplyCollateral): no price, never paused; the user collateral of the asset
+-- stays within supplyCap.
+supplyCollateralWith : Pool -> ProtocolConfig -> Party -> ContractId Account -> Update Account -> MarketId -> Decimal -> TransferArgs -> Update Moved
+supplyCollateralWith pool config user accountCid fetchAcc marketId amount payment = do
+  require "amount must be positive" (amount > 0.0)
+  account <- fetchAcc
+  market <- getMarket pool.markets marketId
+  mp <- marketParamsOf config marketId
+  require "amount below minimum collateral" (toN amount >= mp.minCollateralAmount)
+  let total' = market.totalCollateral + toN amount
+  require "collateral supply cap exceeded" (total' <= mp.supplyCap)
+  _ <- transferNow config.transferFactories mp.collateralInstrument user pool.operator amount payment
+  accountCid' <- replaceAccount accountCid account with
+    collateral = Map.insert marketId (collateralOf marketId account + toN amount) account.collateral
+  poolCid <- create pool with
+    markets = Map.insert marketId (market with totalCollateral = total') pool.markets
+  recordActivity pool.operator config.dso config.featuredAppRight
+  pure (poolCid, accountCid', amount)
+
+-- | Withdraw collateral (withdrawCollateral): with a debt the remaining collateral must cover it.
+-- An asset without a valid price counts as zero, so it can be withdrawn only if the rest covers the debt.
+withdrawCollateralWith
+  : Pool -> ProtocolConfig -> ContractId PauseState -> Party -> ContractId Account -> Update Account
+  -> MarketId -> Decimal -> PriceArgs -> TransferArgs -> Update Moved
+withdrawCollateralWith pool config pauseCid user accountCid fetchAcc marketId amount prices payout = do
+  require "amount must be positive" (amount > 0.0)
+  flags <- loadPause pool.operator config pauseCid
+  require "collateral withdrawal paused" (not flags.collateralWithdrawPaused)
+  account <- fetchAcc
+  market <- getMarket pool.markets marketId
+  mp <- marketParamsOf config marketId
+  s <- accrueNow config pool.state
+  let left = collateralOf marketId account - toN amount
+  require "amount exceeds collateral" (left >= 0.0)
+  require "amount below minimum collateral: withdraw all instead" (left == 0.0 || toN amount >= mp.minCollateralAmount)
+  let collateral' = if left == 0.0 then Map.delete marketId account.collateral
+                    else Map.insert marketId left account.collateral
+  when (account.principal < 0.0) do
+    now <- getTime
+    debtFeed <- loadDebtFeed config prices
+    quoted <- requireE (validPrice config.params now DebtSide debtFeed)
+    -- Audit D-11: for collateral withdrawal the debt is valued at no less than 1 USD
+    let debt = presentDebt s (negate account.principal)
+    lines <- borrowLines config now prices collateral'
+    require "not enough collateral left for the debt" (mulUp debt (maxN quoted 1.0) <= borrowCapacity lines)
+  _ <- transferNow config.transferFactories mp.collateralInstrument pool.operator user amount payout
+  accountCid' <- replaceAccount accountCid account with collateral = collateral'
+  poolCid <- create pool with
+    state = s
+    markets = Map.insert marketId (market with totalCollateral = market.totalCollateral - toN amount) pool.markets
+  recordActivity pool.operator config.dso config.featuredAppRight
+  pure (poolCid, accountCid', amount)
+
+-- Accounting --------------------------------------------------------------------------
+
+-- | Change of an account principal reflected in the pool totals (updateBasePrincipal with
+-- repayAndSupplyAmount and withdrawAndBorrowAmount, risk 8).
+applyPrincipal : PoolState -> N -> N -> PoolState
+applyPrincipal s old new
+  | new >= old =
+      let (repaid, supplied) = repayAndSupply old new
+      in s with
+           totalSupplyPrincipal = s.totalSupplyPrincipal + supplied
+           totalBorrowPrincipal = s.totalBorrowPrincipal - repaid
+  | otherwise =
+      let (withdrawn, borrowed) = withdrawAndBorrow old new
+      in s with
+           totalSupplyPrincipal = s.totalSupplyPrincipal - withdrawn
+           totalBorrowPrincipal = s.totalBorrowPrincipal + borrowed
+
+-- | How much of a principal increase repays debt and how much becomes a deposit (new ≥ old).
+repayAndSupply : N -> N -> (N, N)
+repayAndSupply old new
+  | new <= 0.0 = (new - old, 0.0)
+  | old >= 0.0 = (0.0, new - old)
+  | otherwise = (negate old, new)
+
+-- | How much of a principal decrease withdraws a deposit and how much is borrowed (new < old).
+withdrawAndBorrow : N -> N -> (N, N)
+withdrawAndBorrow old new
+  | new >= 0.0 = (old - new, 0.0)
+  | old <= 0.0 = (0.0, old - new)
+  | otherwise = (old, negate new)
+
+-- | Reserves plus the book value of absorbed collateral (K6, risk 3). No prices needed.
+netReserves : PoolState -> Map MarketId Market -> N
+netReserves s ms = reserves s + sum (map (.protocolCollateralBasis) (Map.values ms))
+
+-- Prices ------------------------------------------------------------------------------
+
+-- | The feeds passed with the command, one per instrument, all from the config's oracle.
+loadFeeds : ProtocolConfig -> [ContractId PriceFeed] -> Update (Map InstrumentId PriceFeed)
+loadFeeds config cids = do
+  feeds <- forA cids fetch
+  forA_ feeds \f -> require "price feed: wrong oracle" (f.oracle == config.roles.oracle)
+  let byInstrument = Map.fromList [ (f.instrumentId, f) | f <- feeds ]
+  require "price feeds: one per instrument" (Map.size byInstrument == length feeds)
+  pure byInstrument
+
+loadDebtFeed : ProtocolConfig -> PriceArgs -> Update PriceFeed
+loadDebtFeed config prices = do
+  cid <- optional (abort "USDCx price feed required") pure prices.debtFeedCid
+  feed <- fetch cid
+  requireE (checkFeed config.roles.oracle config.params.debtInstrument feed)
+  pure feed
+
+-- | Collateral lines for a borrow or a collateral withdrawal: the lower valid quote, or no price;
+-- attested unless the asset needs a fresh reserve attestation that is missing.
+borrowLines : ProtocolConfig -> Time -> PriceArgs -> Map MarketId N -> Update [CollateralLine]
+borrowLines config now prices collateral = do
+  feeds <- loadFeeds config prices.collateralFeedCids
+  atts <- forA prices.attestationCids fetch
+  let byInstrument = Map.fromList [ (a.instrumentId, a) | a <- atts ]
+  forA (heldCollateral collateral) \(marketId, amount) -> do
+    mp <- marketParamsOf config marketId
+    let price = case Map.lookup mp.collateralInstrument feeds of
+          None -> None
+          Some f -> either (const None) Some (validPrice config.params now CollateralSide f)
+        attested = isRight (checkReserve config.roles.oracle mp now (Map.lookup mp.collateralInstrument byInstrument))
+    pure CollateralLine with marketId; amount; params = mp; price; attested
+
+-- Helpers -----------------------------------------------------------------------------
+
+require : Text -> Bool -> Update ()
+require msg ok = unless ok (abort msg)
+
+requireE : Either Text a -> Update a
+requireE = either abort pure
+
+pendingOf : TransferInstructionResult_Output -> Optional (ContractId TransferInstruction)
+pendingOf (TransferInstructionResult_Pending instructionCid) = Some instructionCid
+pendingOf _ = None
+
+-- | This pool's config: the same operator and the same council.
+loadConfig : Pool -> ContractId ProtocolConfig -> Update ProtocolConfig
+loadConfig pool configCid = do
+  config <- fetch configCid
+  require "config belongs to another operator" (config.roles.operator == pool.operator)
+  require "config is not signed by the pool's council" (config.governors == pool.governors)
+  require "config and pool markets differ" (Map.keys config.marketParams == Map.keys pool.markets)
+  pure config
+
+accrueNow : ProtocolConfig -> PoolState -> Update PoolState
+accrueNow config state = do
+  now <- getTime
+  pure (accrue config.params.rateModel now state)
+
+getMarket : Map MarketId Market -> MarketId -> Update Market
+getMarket markets marketId = case Map.lookup marketId markets of
+  None -> abort ("unknown market " <> marketId)
+  Some m -> pure m
+
+fetchAccount : Party -> Party -> ContractId Account -> Update Account
+fetchAccount operator user accountCid = do
+  account <- fetch accountCid
+  require "account belongs to another operator" (account.operator == operator)
+  require "account belongs to another user" (account.owner == user)
+  -- 0.5.0, ADR-004: an EVM user's account moves only with their wallet signature
+  require "EVM account: the operation needs the EVM wallet signature" (account.evmAddress == None)
+  -- 0.7.0: a Loop account only through Pool_LoopWalletExecute
+  require "Loop account: the operation needs the Loop wallet signature" (account.loopParty == None)
+  pure account
+
+-- | EVM user's account: the custodian is the owner, the address is the signing wallet's address.
+fetchEvmAccount : Party -> Party -> Text -> ContractId Account -> Update Account
+fetchEvmAccount operator custody address accountCid = do
+  account <- fetch accountCid
+  require "account belongs to another operator" (account.operator == operator)
+  require "account belongs to another user" (account.owner == custody)
+  require "EVM wallet belongs to another account" (account.evmAddress == Some address)
+  pure account
+
+-- | Loop user's account: the custodian is the owner, the party is the wallet's party.
+fetchLoopAccount : Party -> Party -> Text -> ContractId Account -> Update Account
+fetchLoopAccount operator custody party accountCid = do
+  account <- fetch accountCid
+  require "account belongs to another operator" (account.operator == operator)
+  require "account belongs to another user" (account.owner == custody)
+  require "Loop wallet belongs to another account" (account.loopParty == Some party && account.evmAddress == None)
+  pure account
+
+replaceAccount : ContractId Account -> Account -> Update (ContractId Account)
+replaceAccount accountCid account = do
+  archive accountCid
+  create account
+
+-- | Minimum USDCx operation (re-audit M2): 1 USDCx for supply and withdrawal; every operation
+-- re-creates Pool, and dust broke other users' prepared commands. The full flags have no minimum.
+minOperationAmount : N
+minOperationAmount = 1.0
+
+-- | State of a new pool.
+newPoolState : Time -> PoolState
+newPoolState now = PoolState with
+  totalSupplyPrincipal = 0.0
+  totalBorrowPrincipal = 0.0
+  supplyIndex = 1.0
+  borrowIndex = 1.0
+  cash = 0.0
+  lastUpdate = now
+
+-- | Account balance in USDCx at the current indices (positive: deposit, negative: debt).
+accountBalance : PoolState -> Account -> N
+accountBalance s account = presentValue s account.principal
+
+-- | Collateral of an account as a list.
+accountCollateral : Account -> [(MarketId, N)]
+accountCollateral account = heldCollateral account.collateral

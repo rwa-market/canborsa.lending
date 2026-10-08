@@ -1,0 +1,142 @@
+-- | T4.1.1 2-of-3 council for protocol parameters. Audit S9 regression: expiry and base parameters.
+module Test.Lending.GovernanceTest where
+
+import DA.Map qualified as Map
+import DA.Time (addRelTime, days, hours, seconds)
+import Daml.Script
+
+import Lending.Config
+import Lending.Governance
+import Lending.Types
+import Test.Lending.Env
+
+data Council = Council with cid : ContractId GovernanceCouncil; m1 : Party; m2 : Party; m3 : Party; outsider : Party
+
+setupCouncil : Env -> Script Council
+setupCouncil env = do
+  m1 <- allocateParty "Member1"
+  m2 <- allocateParty "Member2"
+  m3 <- allocateParty "Member3"
+  outsider <- allocateParty "Outsider"
+  cid <- submit (actAs [env.operator, m1, m2, m3]) $ createCmd GovernanceCouncil with
+    operator = env.operator; members = [m1, m2, m3]; threshold = 2
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd cid Council_Adopt with configCid; poolCid
+  pure Council with ..
+
+propose : Env -> Council -> Party -> Text -> (MarketParams -> MarketParams) -> Script (ContractId ParameterChangeProposal)
+propose env c proposer proposalId f = do
+  (configCid, config) <- currentConfig env
+  now <- getTime
+  submit proposer $ exerciseCmd c.cid Council_Propose with
+    proposer; proposalId; description = proposalId; configCid
+    newParams = config.params
+    newMarketParams = Map.alter (fmap f) "CBTC" config.marketParams
+    newTransferFactories = None
+    expiresAt = addRelTime now (days 3)
+    featuredAppRightChange = None
+    newRoles = None
+
+test_councilTwoOfThree : Script ()
+test_councilTwoOfThree = do
+  env <- setup
+  c <- setupCouncil env
+  -- user operations work on the council's pool
+  seedLiquidity env 10000.0
+  now <- getTime
+  (configCid, config) <- currentConfig env
+  assertMsg "config governed" (config.governors == [c.m1, c.m2, c.m3])
+  -- the operator no longer changes parameters on its own
+  submitMustFail env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None; newFeaturedAppRight = None; newRoles = None
+  submitMustFail c.outsider $ exerciseCmd c.cid Council_Propose with
+    proposer = c.outsider; proposalId = "p0"; description = "x"; configCid
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    expiresAt = addRelTime now (days 1); featuredAppRightChange = None; newRoles = None
+  p1 <- propose env c c.m1 "p1" (\m -> m with borrowCollateralFactor = 0.45)
+  -- one signature: cannot execute
+  submitMustFail c.m1 $ exerciseCmd p1 Proposal_Execute with executor = c.m1; configCid
+  submitMustFail c.m1 $ exerciseCmd p1 Proposal_Approve with approver = c.m1
+  submitMustFail c.outsider $ exerciseCmd p1 Proposal_Approve with approver = c.outsider
+  p1' <- submit c.m2 $ exerciseCmd p1 Proposal_Approve with approver = c.m2
+  _ <- submit c.m3 $ exerciseCmd p1' Proposal_Execute with executor = c.m3; configCid
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "LTV changed to 45%" (mp.borrowCollateralFactor == 0.45)
+  -- borrow at 50% rejected, at 45% passes
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  mustFail env env.bob (borrowCmd env env.bob 4500.0001)
+  run env env.bob (borrowCmd env env.bob 4500.0)
+  -- invalid parameter: LTV ≥ LT is rejected at execution
+  bad <- propose env c c.m1 "p2" (\m -> m with borrowCollateralFactor = 0.7)
+  bad' <- submit c.m2 $ exerciseCmd bad Proposal_Approve with approver = c.m2
+  (configCid', _) <- currentConfig env
+  submitMustFail c.m2 $ exerciseCmd bad' Proposal_Execute with executor = c.m2; configCid = configCid'
+
+-- Audit S9: a stale proposal does not roll back a newer decision
+test_staleProposalRejected : Script ()
+test_staleProposalRejected = do
+  env <- setup
+  c <- setupCouncil env
+  old <- propose env c c.m1 "old" (\m -> m with borrowCollateralFactor = 0.4)
+  old' <- submit c.m2 $ exerciseCmd old Proposal_Approve with approver = c.m2
+  new <- propose env c c.m1 "new" (\m -> m with borrowCollateralFactor = 0.3)
+  new' <- submit c.m3 $ exerciseCmd new Proposal_Approve with approver = c.m3
+  (configCid, _) <- currentConfig env
+  _ <- submit c.m1 $ exerciseCmd new' Proposal_Execute with executor = c.m1; configCid
+  (configCid', _) <- currentConfig env
+  submitMustFail c.m2 $ exerciseCmd old' Proposal_Execute with executor = c.m2; configCid = configCid'
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "newer decision kept" (mp.borrowCollateralFactor == 0.3)
+
+test_expiredProposalRejected : Script ()
+test_expiredProposalRejected = do
+  env <- setup
+  c <- setupCouncil env
+  p <- propose env c c.m1 "p" (\m -> m with borrowCollateralFactor = 0.45)
+  p' <- submit c.m2 $ exerciseCmd p Proposal_Approve with approver = c.m2
+  passTime (days 3 + hours 1)
+  (configCid, _) <- currentConfig env
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+
+-- Audit, low: only the author can withdraw a proposal
+test_onlyProposerWithdraws : Script ()
+test_onlyProposerWithdraws = do
+  env <- setup
+  c <- setupCouncil env
+  p <- propose env c c.m1 "p" (\m -> m with borrowCollateralFactor = 0.45)
+  submitMustFail c.m2 $ exerciseCmd p Proposal_Withdraw with actor = c.m2
+  submit c.m1 $ exerciseCmd p Proposal_Withdraw with actor = c.m1
+
+
+-- Risk 9: a lower liquidation factor takes effect 2 days after the proposal; raising it does not wait
+test_lowerLiquidationFactorWaits : Script ()
+test_lowerLiquidationFactorWaits = do
+  env <- setup
+  c <- setupCouncil env
+  (configCid, config) <- currentConfig env
+  now <- getTime
+  -- the proposal must outlive the delay
+  submitMustFail c.m1 $ exerciseCmd c.cid Council_Propose with
+    proposer = c.m1; proposalId = "short"; description = "x"; configCid
+    newParams = config.params
+    newMarketParams = Map.alter (fmap (\m -> m with liquidateCollateralFactor = 0.6)) "CBTC" config.marketParams
+    newTransferFactories = None; expiresAt = addRelTime now (days 2); featuredAppRightChange = None; newRoles = None
+  p <- propose env c c.m1 "lcf-60" (\m -> m with liquidateCollateralFactor = 0.6)
+  p' <- submit c.m2 $ exerciseCmd p Proposal_Approve with approver = c.m2
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+  -- one second before the delay: still rejected
+  passTime (days 2 - seconds 1)
+  submitMustFail c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+  -- exactly at the delay: applied
+  passTime (seconds 1)
+  _ <- submit c.m1 $ exerciseCmd p' Proposal_Execute with executor = c.m1; configCid
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "liquidation factor lowered to 60%" (mp.liquidateCollateralFactor == 0.6)
+  -- raising it back applies at once
+  up <- propose env c c.m1 "lcf-65" (\m -> m with liquidateCollateralFactor = 0.65)
+  up' <- submit c.m2 $ exerciseCmd up Proposal_Approve with approver = c.m2
+  (configCid', _) <- currentConfig env
+  _ <- submit c.m1 $ exerciseCmd up' Proposal_Execute with executor = c.m1; configCid = configCid'
+  mp' <- marketParamsFor env "CBTC"
+  assertMsg "liquidation factor raised to 65%" (mp'.liquidateCollateralFactor == 0.65)

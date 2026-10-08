@@ -1,0 +1,539 @@
+-- | Control examples 1–11 of docs/requirements/compound-v3-migration ("Контрольные примеры"):
+-- each one with its numbers. Prices as in Env: CC $0.20, CBTC $100 000, USDCx $1.
+module Test.Lending.ExamplesTest where
+
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import DA.List ((!!))
+import DA.Map qualified as Map
+import DA.Text qualified as T
+import DA.Time (seconds)
+import Daml.Script
+
+import Splice.Api.Token.HoldingV1 qualified as H
+
+import Splice.Testing.Tokens.TestTokenV1 (Token)
+
+import Lending.Account
+import Lending.Oracle
+import Lending.Math
+import Lending.Pause
+import Lending.Pool
+import Lending.Rates
+import Lending.Types
+import Test.Lending.Env
+
+-- Helpers ------------------------------------------------------------------------------
+
+tryUser : Env -> Party -> Script (Commands a) -> Script (Either SubmitError a)
+tryUser env user mk = do
+  cmd <- mk
+  ds <- disclosures env
+  trySubmit (actAs user <> discloseMany ds) cmd
+
+-- | The command fails, and the error names the reason.
+failsWith : Text -> Script (Either SubmitError a) -> Script ()
+failsWith expected run' = do
+  r <- run'
+  case r of
+    Left err -> unless' (expected `T.isInfixOf` show err) ("expected '" <> expected <> "', got " <> show err)
+    Right _ -> abort ("expected failure: " <> expected)
+
+unless' : Bool -> Text -> Script ()
+unless' ok msg = if ok then pure () else abort msg
+
+eqN : Text -> N -> N -> Script ()
+eqN label expected actual = unless' (expected == actual) (label <> ": expected " <> show expected <> ", got " <> show actual)
+
+-- | Disclosures without querying the single PauseState (a second one exists in the test).
+disclosuresWithPause : Env -> ContractId PauseState -> Script [Disclosure]
+disclosuresWithPause env pauseCid = do
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  c <- queryDisclosure env.operator configCid
+  pl <- queryDisclosure env.operator poolCid
+  pa <- queryDisclosure env.operator pauseCid
+  let ds = [c, pl, pa]
+  feeds <- query @PriceFeed env.oracle
+  feedDs <- forA feeds \(cid, _) -> queryDisclosure env.oracle cid
+  atts <- query @ReserveAttestation env.oracle
+  attDs <- forA atts \(cid, _) -> queryDisclosure env.oracle cid
+  rules <- forA [env.usdcx, env.cc, env.cbtc] \i -> rulesFor i >>= queryDisclosure i.admin
+  opHoldings <- queryInterface @H.Holding env.operator
+  held <- forA [ cid | (cid, Some v) <- opHoldings, v.owner == env.operator, v.lock == None ] \cid ->
+    queryDisclosure env.operator (fromInterfaceContractId @Token cid)
+  pure [ d | Some d <- ds <> feedDs <> attDs <> rules <> held ]
+
+absorbTry : Env -> Party -> Script (Either SubmitError (ContractId Pool, ContractId Account))
+absorbTry env user = do
+  prices <- allPrices env
+  cmd <- absorbCmdWith env user prices
+  trySubmit env.operator cmd
+
+-- | Carol: 50 000 CC as collateral and a 3 000 USDCx loan (examples 4–7).
+carolBorrows : Env -> Script ()
+carolBorrows env = do
+  run env env.carol (depositCmd env env.carol "CC" 50000.0)
+  run env env.carol (borrowCmd env env.carol 3000.0)
+
+-- 1. Shared collateral --------------------------------------------------------------------
+
+test_example1_sharedCollateral : Script ()
+test_example1_sharedCollateral = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  -- 5 001 is above the per-user cap of 5 000; 5 000 passes: risk 5 000 / 8 300 = 60.2%
+  failsWith "max debt per user exceeded" (tryUser env env.bob (borrowCmd env env.bob 5001.0))
+  run env env.bob (borrowCmd env env.bob 5000.0)
+  balanceFor env env.bob >>= eqN "debt" (-5000.0)
+
+-- The capacity of 6 200 at its boundary, with the per-user cap raised
+test_example1_capacityBoundary : Script ()
+test_example1_capacityBoundary = do
+  env <- setup
+  seedLiquidity env 20000.0
+  updateParams env (\p -> p with maxDebtPerUser = 10000.0) []
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  failsWith "not enough collateral for the loan" (tryUser env env.bob (borrowCmd env env.bob 6200.0001))
+  run env env.bob (borrowCmd env env.bob 6200.0)
+
+-- 2. Supply repays the debt ---------------------------------------------------------------
+
+test_example2_supplyRepaysDebt : Script ()
+test_example2_supplyRepaysDebt = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  before <- poolState env
+  run env env.bob (supplyCmd env env.bob 1500.0)
+  balanceFor env env.bob >>= eqN "deposit" 500.0
+  after <- poolState env
+  eqN "pool debt down 1 000" (before.totalBorrowPrincipal - 1000.0) after.totalBorrowPrincipal
+  eqN "pool supply up 500" (before.totalSupplyPrincipal + 500.0) after.totalSupplyPrincipal
+
+-- 3. A withdrawal does not become a loan --------------------------------------------------
+
+test_example3_withdrawIsNotBorrow : Script ()
+test_example3_withdrawIsNotBorrow = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (supplyCmd env env.bob 500.0)
+  failsWith "withdrawal exceeds the deposit: borrow explicitly" (tryUser env env.bob (withdrawCmd env env.bob 600.0))
+  -- debt 100 is below the minimum loan of 250
+  failsWith "debt below minimum loan" (tryUser env env.bob (borrowCmd env env.bob 600.0))
+  -- the boundary: exactly 250 of debt passes, 249.9999999999 does not
+  failsWith "debt below minimum loan" (tryUser env env.bob (borrowCmd env env.bob 749.9999999999))
+  run env env.bob (borrowCmd env env.bob 800.0)
+  balanceFor env env.bob >>= eqN "debt" (-300.0)
+
+test_example3_minLoanBoundary : Script ()
+test_example3_minLoanBoundary = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (supplyCmd env env.bob 500.0)
+  run env env.bob (borrowCmd env env.bob 750.0)
+  balanceFor env env.bob >>= eqN "debt at the minimum" (-250.0)
+
+-- 4. Absorb without bad debt -----------------------------------------------------------
+
+test_example4_absorb : Script ()
+test_example4_absorb = do
+  env <- setup
+  seedLiquidity env 20000.0
+  carolBorrows env
+  -- $0.134: liquidation point 3 015 above the debt of 3 000
+  setPrice env env.cc 0.134
+  failsWith "account is not liquidatable" (absorbTry env env.carol)
+  setPrice env env.cc 0.13
+  reservesBefore <- poolReserves env
+  netBefore <- poolNetReserves env
+  absorb env env.carol
+  balanceFor env env.carol >>= eqN "credited 6 045, balance +3 045" 3045.0
+  collateralFor env env.carol "CC" >>= eqN "collateral taken" 0.0
+  m <- marketOf env "CC"
+  eqN "protocol holds the collateral" 50000.0 m.protocolCollateral
+  eqN "book value" 6045.0 m.protocolCollateralBasis
+  eqN "user collateral" 0.0 m.totalCollateral
+  poolReserves env >>= eqN "reserves down 6 045" (reservesBefore - 6045.0)
+  poolNetReserves env >>= eqN "net reserves unchanged" netBefore
+
+-- 5. Collateral purchase after example 4 ----------------------------------------------------
+
+test_example5_buyCollateral : Script ()
+test_example5_buyCollateral = do
+  env <- setup
+  seedLiquidity env 20000.0
+  carolBorrows env
+  setPrice env env.cc 0.13
+  absorb env env.carol
+  mint env env.usdcx env.liquidator 6136.0
+  netBefore <- poolNetReserves env
+  -- price 0.12272: 6 136 USDCx buy exactly 50 000 CC; asking for 50 001 is rejected
+  failsWith "collateral received below the minimum" (tryUser env env.liquidator (buyCmd env env.liquidator "CC" 6136.0 50001.0))
+  -- not an approved buyer
+  mint env env.usdcx env.alice 10.0
+  failsWith "buyer is not approved" (tryUser env env.alice (buyCmd env env.alice "CC" 10.0 0.0))
+  run env env.liquidator (buyCmd env env.liquidator "CC" 6136.0 50000.0)
+  balanceOf env.liquidator env.cc >>= eqD "bought" 50000.0
+  m <- marketOf env "CC"
+  eqN "nothing left" 0.0 m.protocolCollateral
+  eqN "book value zero" 0.0 m.protocolCollateralBasis
+  poolNetReserves env >>= eqN "net reserves up 91" (netBefore + 91.0)
+
+-- 1.0.1: a rest that one USDCx unit cannot buy goes with the purchase; nothing stays in stock
+test_example5_dustRest : Script ()
+test_example5_dustRest = do
+  env <- setup
+  seedLiquidity env 20000.0
+  carolBorrows env
+  setPrice env env.cc 0.13
+  absorb env env.carol
+  mint env env.usdcx env.liquidator 6136.0
+  -- 6 135.9999999999 / 0.12272 = 49 999.9999999991…: the rest 0.0000000009 CC is worth more than
+  -- one unit (0.0000000001 / 0.12272 = 0.000000000815 CC), so it stays for sale
+  run env env.liquidator (buyCmd env env.liquidator "CC" 6135.9999999999 0.0)
+  m <- marketOf env "CC"
+  eqN "rest for sale" 0.0000000009 m.protocolCollateral
+  -- one unit buys 0.0000000008 CC; the rest 0.0000000001 CC would be dust: the buyer gets all
+  run env env.liquidator (buyCmd env env.liquidator "CC" 0.0000000001 0.0)
+  m' <- marketOf env "CC"
+  eqN "no dust left" 0.0 m'.protocolCollateral
+  eqN "book value zero" 0.0 m'.protocolCollateralBasis
+  balanceOf env.liquidator env.cc >>= eqD "bought the whole stock" 50000.0
+
+-- Reserves at the target close the sale; just below it is open
+test_example5_targetReserves : Script ()
+test_example5_targetReserves = do
+  env <- setup
+  seedLiquidity env 20000.0
+  carolBorrows env
+  setPrice env env.cc 0.13
+  absorb env env.carol
+  -- reserves −6 045 + 56 045 = exactly 50 000
+  addReserves env 56045.0
+  poolReserves env >>= eqN "reserves at target" 50000.0
+  mint env env.usdcx env.liquidator 1000.0
+  failsWith "collateral not for sale: reserves at target" (tryUser env env.liquidator (buyCmd env env.liquidator "CC" 100.0 0.0))
+  updateParams env (\p -> p with targetReserves = 50000.0000000001) []
+  run env env.liquidator (buyCmd env env.liquidator "CC" 100.0 0.0)
+
+-- 6. Bad debt ------------------------------------------------------------------------------
+
+test_example6_badDebt : Script ()
+test_example6_badDebt = do
+  env <- setup
+  seedLiquidity env 20000.0
+  addReserves env 500.0
+  -- Bob has a loan against CBTC to repay later
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  carolBorrows env
+  setPrice env env.cc 0.05
+  netBefore <- poolNetReserves env
+  absorb env env.carol
+  -- value 2 500, credited 2 325, bad debt 675: net reserves fall by the bad debt alone
+  poolNetReserves env >>= eqN "bad debt 675" (netBefore - 675.0)
+  balanceFor env env.carol >>= eqN "balance zeroed" 0.0
+  m <- marketOf env "CC"
+  eqN "book value" 2325.0 m.protocolCollateralBasis
+  poolNetReserves env >>= eqN "net reserves" (-175.0)
+  -- new loans and deposit withdrawals wait; supply, repayment, collateral and the sale work
+  failsWith "reserves are negative" (tryUser env env.bob (borrowCmd env env.bob 300.0))
+  failsWith "reserves are negative" (tryUser env env.alice (withdrawCmd env env.alice 100.0))
+  run env env.alice (supplyCmd env env.alice 100.0)
+  run env env.bob (supplyCmd env env.bob 100.0)
+  run env env.bob (depositCmd env env.bob "CC" 100.0)
+  addReserves env 175.0
+  poolNetReserves env >>= eqN "net reserves back to zero" 0.0
+  run env env.alice (withdrawCmd env env.alice 100.0)
+  run env env.bob (borrowCmd env env.bob 300.0)
+  mint env env.usdcx env.liquidator 1000.0
+  run env env.liquidator (buyCmd env env.liquidator "CC" 1000.0 0.0)
+
+-- The sale works with negative net reserves
+test_example6_buyWhileNegative : Script ()
+test_example6_buyWhileNegative = do
+  env <- setup
+  seedLiquidity env 20000.0
+  addReserves env 500.0
+  carolBorrows env
+  setPrice env env.cc 0.05
+  absorb env env.carol
+  mint env env.usdcx env.backstop 1000.0
+  run env env.backstop (buyCmd env env.backstop "CC" 1000.0 0.0)
+
+-- 7. No false stop -----------------------------------------------------------------------
+
+test_example7_noFalseStop : Script ()
+test_example7_noFalseStop = do
+  env <- setup
+  seedLiquidity env 20000.0
+  addReserves env 5000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  carolBorrows env
+  setPrice env env.cc 0.13
+  absorb env env.carol
+  poolReserves env >>= eqN "reserves" (-1045.0)
+  poolNetReserves env >>= eqN "net reserves" 5000.0
+  run env env.alice (withdrawCmd env env.alice 100.0)
+  run env env.bob (borrowCmd env env.bob 300.0)
+
+-- 8. No valid price --------------------------------------------------------------------
+
+test_example8_noValidPrice : Script ()
+test_example8_noValidPrice = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 300.0)
+  -- the CBTC price goes stale, CC and USDCx are fresh: capacity is CC only, 1 200
+  passTime (seconds 301)
+  refreshPrice env env.cc
+  refreshPrice env env.usdcx
+  failsWith "not enough collateral for the loan" (tryUser env env.bob (borrowCmd env env.bob 1000.0))
+  -- 300 plus interest over 301 s plus 899 stays below 1 200
+  run env env.bob (borrowCmd env env.bob 899.0)
+  -- the CBTC itself can be withdrawn only if the rest covers the debt
+  run env env.bob (withdrawCollateralCmd env env.bob "CBTC" 0.1)
+  -- absorb needs every price
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  setPrice env env.cc 0.01
+  failsWith "stale price" (absorbTry env env.bob)
+  refreshPrice env env.cbtc
+  failsWith "account is not liquidatable" (absorbTry env env.bob)
+
+-- 9. Pauses -----------------------------------------------------------------------------
+
+-- | Alice supplies, Bob borrows against CBTC, Carol is absorbable at CC $0.13 and is absorbed so
+-- that collateral is for sale.
+pauseSetup : Script Env
+pauseSetup = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  carolBorrows env
+  mint env env.usdcx env.liquidator 10000.0
+  mint env env.cc env.bob 1000.0
+  pure env
+
+-- | Operations that are never paused.
+alwaysOpen : Env -> Script ()
+alwaysOpen env = do
+  run env env.alice (supplyCmd env env.alice 10.0)
+  run env env.bob (supplyCmd env env.bob 10.0)
+  run env env.bob (depositCmd env env.bob "CC" 10.0)
+
+-- | The pausable user operations that a flag other than their own leaves open: a loan from Bob
+-- (no deposit, so it does not touch deposit withdrawals), a deposit withdrawal by Alice and a
+-- collateral withdrawal by Bob. Bob repays the loan so the next round starts from the same debt.
+othersOpen : Env -> [Text] -> Script ()
+othersOpen env closed = do
+  unless ("borrow" `elem` closed) do
+    run env env.bob (borrowCmd env env.bob 300.0)
+    run env env.bob (supplyCmd env env.bob 300.0)
+  unless ("supplyWithdraw" `elem` closed) $ run env env.alice (withdrawCmd env env.alice 10.0)
+  unless ("collateralWithdraw" `elem` closed) $ run env env.bob (withdrawCollateralCmd env env.bob "CC" 10.0)
+
+test_example9_pauses : Script ()
+test_example9_pauses = do
+  env <- pauseSetup
+  -- only the guardian sets the flags
+  (pauseCid, _) <- currentPause env
+  submitMustFail env.operator $ exerciseCmd pauseCid PauseState_Set with newFlags = noPause with borrowPaused = True
+  submitMustFail env.alice $ exerciseCmd pauseCid PauseState_Set with newFlags = noPause with borrowPaused = True
+
+  -- each flag closes its own operation; the other four and supply, repayment, collateral deposit pass
+  setPauseFlags env (const noPause with borrowPaused = True)
+  alwaysOpen env
+  failsWith "borrowing paused" (tryUser env env.bob (borrowCmd env env.bob 300.0))
+  othersOpen env ["borrow"]
+
+  setPauseFlags env (const noPause with collateralWithdrawPaused = True)
+  alwaysOpen env
+  failsWith "collateral withdrawal paused" (tryUser env env.bob (withdrawCollateralCmd env env.bob "CC" 10.0))
+  othersOpen env ["collateralWithdraw"]
+
+  setPauseFlags env (const noPause with supplyWithdrawPaused = True)
+  alwaysOpen env
+  failsWith "deposit withdrawals paused" (tryUser env env.alice (withdrawCmd env env.alice 10.0))
+  othersOpen env ["supplyWithdraw"]
+
+  setPrice env env.cc 0.13
+  setPauseFlags env (const noPause with absorbPaused = True)
+  alwaysOpen env
+  failsWith "absorb paused" (absorbTry env env.carol)
+  othersOpen env []
+  setPauseFlags env (const noPause)
+  absorb env env.carol
+
+  setPauseFlags env (const noPause with buyPaused = True)
+  alwaysOpen env
+  failsWith "collateral purchase paused" (tryUser env env.liquidator (buyCmd env env.liquidator "CC" 1000.0 0.0))
+  othersOpen env []
+
+  -- every flag at once: supply, repayment and collateral deposit still pass
+  setPauseFlags env (const PauseFlags with
+    borrowPaused = True; collateralWithdrawPaused = True; supplyWithdrawPaused = True
+    absorbPaused = True; buyPaused = True)
+  alwaysOpen env
+  setPauseFlags env (const noPause)
+  run env env.liquidator (buyCmd env env.liquidator "CC" 1000.0 0.0)
+
+-- A loan that first takes the user's deposit also withdraws it: the deposit-withdrawal pause
+-- closes it, a loan without a deposit passes
+test_example9_borrowFromDeposit : Script ()
+test_example9_borrowFromDeposit = do
+  env <- pauseSetup
+  run env env.bob (supplyCmd env env.bob 1500.0)
+  balanceFor env env.bob >>= eqN "deposit" 500.0
+  setPauseFlags env (const noPause with supplyWithdrawPaused = True)
+  failsWith "deposit withdrawals paused" (tryUser env env.bob (borrowCmd env env.bob 800.0))
+  setPauseFlags env (const noPause)
+  run env env.bob (borrowCmd env env.bob 800.0)
+  balanceFor env env.bob >>= eqN "debt" (-300.0)
+
+-- Pause flags of another guardian are not accepted; the operator rebinds them after a role change
+test_example9_pauseBinding : Script ()
+test_example9_pauseBinding = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  (pauseCid, _) <- currentPause env
+  fake <- submit env.operator $ createCmd PauseState with operator = env.operator; guardian = env.alice; flags = noPause
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (accountCid, _) <- accountOf env env.bob
+  prices <- allPrices env
+  payout <- transferArgs env.operator env.usdcx
+  ds <- disclosuresWithPause env pauseCid
+  Some fakeD <- queryDisclosure env.operator fake
+  r <- trySubmit (actAs env.bob <> discloseMany (fakeD :: ds)) $ exerciseCmd poolCid Pool_WithdrawBase with
+    user = env.bob; configCid; pauseCid = fake; accountCid; amount = 300.0; full = False; allowBorrow = True; prices; payout
+  case r of
+    Left err -> unless' ("pause flags of another guardian" `T.isInfixOf` show err) (show err)
+    Right _ -> abort "foreign pause flags accepted"
+  -- a rebind without a guardian change is refused
+  submitMustFail env.operator $ exerciseCmd pauseCid PauseState_Rebind with configCid
+
+-- 10. Rates ---------------------------------------------------------------------------
+
+test_example10_rates : Script ()
+test_example10_rates = do
+  env <- setup
+  updateParams env (\p -> p with maxDebtPerUser = 10000.0) []
+  seedLiquidity env 10000.0
+  addReserves env 15000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.5)
+  run env env.bob (borrowCmd env env.bob 6500.0)
+  s <- poolState env
+  let u = utilization (totalDebt s) (totalSupply s)
+  eqN "utilization 65%: reserves in cash do not count" 0.65 u
+  eqN "borrow rate 10%" 0.1 (borrowRate defaultRateModel u)
+  eqN "supply rate 5.2%" 0.052 (supplyRate defaultRateModel u)
+  -- the ceiling is 80% of 10 000: debt may reach 8 000, not more
+  failsWith "max utilization exceeded" (tryUser env env.bob (borrowCmd env env.bob 1500.0001))
+  run env env.bob (borrowCmd env env.bob 1500.0)
+
+-- 11. Accounting converges -------------------------------------------------------------
+
+-- | Σ positive principals = pool supply, Σ negative = pool debt, Σ account collateral = market
+-- collateral; operator holdings = cash and market collateral + protocol stock.
+checkInvariants : Env -> Script ()
+checkInvariants env = do
+  (_, pool) <- currentPool env
+  accounts <- query @Account env.operator
+  let principals = map ((.principal) . snd) accounts
+  eqN "supply principal" pool.state.totalSupplyPrincipal (sum (filter (> 0.0) principals))
+  eqN "borrow principal" pool.state.totalBorrowPrincipal (negate (sum (filter (< 0.0) principals)))
+  forA_ (Map.toList pool.markets) \(marketId, m) -> do
+    eqN ("collateral " <> marketId) m.totalCollateral (sum (map (collateralOf marketId . snd) accounts))
+    held <- balanceOf env.operator (marketInstrument env marketId)
+    eqN ("holdings " <> marketId) (m.totalCollateral + m.protocolCollateral) (toN held)
+  cash <- balanceOf env.operator env.usdcx
+  eqN "cash" pool.state.cash (toN cash)
+
+test_example11_convergence : Script ()
+test_example11_convergence = do
+  env <- setup
+  mint env env.usdcx env.carol 5000.0
+  let step = do
+        passTime (seconds 3600)
+        refreshPrices env
+        checkInvariants env
+  seedLiquidity env 20000.0
+  step
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.carol (depositCmd env env.carol "CC" 30000.0)
+  step
+  run env env.bob (supplyCmd env env.bob 500.0)
+  -- deposit 500 → debt: crosses zero downwards
+  run env env.bob (borrowCmd env env.bob 1500.0)
+  step
+  run env env.carol (borrowCmd env env.carol 1000.0)
+  step
+  -- debt → deposit: crosses zero upwards
+  run env env.bob (supplyCmd env env.bob 2000.0)
+  step
+  run env env.carol (repayAllCmd env env.carol 2000.0)
+  balanceFor env env.carol >>= eqN "repaid exactly" 0.0
+  step
+  run env env.bob (withdrawAllCmd env env.bob)
+  balanceFor env env.bob >>= eqN "withdrawn exactly" 0.0
+  step
+  run env env.carol (borrowCmd env env.carol 1500.0)
+  run env env.carol (withdrawCollateralCmd env env.carol "CC" 1000.0)
+  step
+  setPrice env env.cc 0.08
+  absorb env env.carol
+  step
+  mint env env.usdcx env.liquidator 5000.0
+  run env env.liquidator (buyCmd env env.liquidator "CC" 1000.0 0.0)
+  step
+  run env env.alice (withdrawCmd env env.alice 1000.0)
+  step
+
+-- Example 11, randomized (risk 8): 60 steps of supply, withdraw, borrow, repay all and collateral
+-- moves by four users in a pseudo-random order (a fixed LCG seed, reproducible). Rejected steps are
+-- fine; after every step the principal totals match the accounts exactly and cash matches tokens.
+test_example11_randomized : Script ()
+test_example11_randomized = do
+  env <- setup
+  dave <- allocateParty "Dave"
+  let users = [env.alice, env.bob, env.carol, dave]
+  forA_ users \u -> do
+    mint env env.usdcx u 20000.0
+    mint env env.cbtc u 0.2
+    mint env env.cc u 50000.0
+  seedLiquidity env 20000.0
+  openAccount env dave
+  randomSteps env users 60 42
+
+-- | One pseudo-random step per call (an LCG on `x`), then the invariants; `n` steps in all.
+randomSteps : Env -> [Party] -> Int -> Int -> Script ()
+randomSteps _ _ 0 _ = pure ()
+randomSteps env users n x = do
+  let r = (1103515245 * x + 12345) % 2147483648
+      u = users !! (r % 4)
+      op = (r / 4) % 7
+      amount = intToDecimal (100 + (r / 28) % 1900)
+  cmd <- case op of
+    0 -> supplyCmd env u amount
+    1 -> withdrawCmd env u amount
+    2 -> borrowCmd env u amount
+    3 -> repayAllCmd env u (amount * 3.0)
+    4 -> depositCmd env u "CBTC" 0.01
+    5 -> withdrawCollateralCmd env u "CBTC" 0.01
+    _ -> withdrawAllCmd env u
+  _ <- tryUser env u (pure cmd)
+  passTime (seconds ((r / 7) % 7200))
+  refreshPrices env
+  checkInvariants env
+  randomSteps env users (n - 1) r

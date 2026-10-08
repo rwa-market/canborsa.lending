@@ -1,0 +1,350 @@
+-- | Governance through a BitSafe Decentralized Party (lending-decman): 2-of-3 GovernanceRules of
+-- governance-core-v1 run the lending council. Members submit as themselves with readAs of the
+-- decentralized party, as on a DecMan node that hosts it.
+module Test.Lending.DecManTest where
+
+import DA.List (sort)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import DA.Text (isInfixOf)
+import DA.Time (addRelTime, days, hours, seconds)
+import Daml.Script
+
+import Governance.Action (GovernableAction)
+import Governance.Confirmation (GovernanceConfirmation)
+import Governance.ExecutionResult
+import Governance.Rules
+
+import Lending.Account (Account)
+import Lending.Config
+import Lending.DecMan
+import Lending.Math (N)
+import Lending.Governance
+import Lending.Pool (Pool)
+import Lending.Types
+import Test.Lending.Env
+
+data Dm = Dm with
+  dp : Party
+  m1 : Party
+  m2 : Party
+  m3 : Party
+  outsider : Party
+  rulesCid : ContractId GovernanceRules
+  councilCid : ContractId GovernanceCouncil
+
+as : Dm -> Party -> SubmitOptions
+as d m = actAs m <> readAs d.dp
+
+confirm : Dm -> Party -> ContractId GovernableAction -> Script (ContractId GovernanceConfirmation)
+confirm d m actionCid = do
+  r <- submit (as d m) $ exerciseCmd d.rulesCid GovernanceRules_ConfirmAction with
+    confirmer = m; actionProposalCid = actionCid
+  pure r.confirmationCid
+
+executeCmd : Dm -> Party -> ContractId GovernableAction -> [ContractId GovernanceConfirmation] -> Commands ExecuteConfirmedActionResult
+executeCmd d executor actionCid confirmations = exerciseCmd d.rulesCid GovernanceRules_ExecuteConfirmedAction with
+  executor; actionProposalCid = actionCid; confirmations
+
+-- | Confirmations of m1 and m2, execution by m1.
+passVote : Dm -> ContractId GovernableAction -> Script ()
+passVote d actionCid = do
+  c1 <- confirm d d.m1 actionCid
+  c2 <- confirm d d.m2 actionCid
+  _ <- submit (as d d.m1) $ executeCmd d d.m1 actionCid [c1, c2]
+  pure ()
+
+-- | Decentralized party with 2-of-3 rules; the first council is formed with it as the only member.
+setupDm : Env -> Script Dm
+setupDm env = do
+  dp <- allocateParty "DecentralizedParty"
+  m1 <- allocateParty "DmMember1"
+  m2 <- allocateParty "DmMember2"
+  m3 <- allocateParty "DmMember3"
+  outsider <- allocateParty "DmOutsider"
+  rulesCid <- submit dp $ createCmd GovernanceRules with
+    governanceParty = dp; members = Set.fromList [m1, m2, m3]; threshold = 2
+    actionConfirmationTimeout = hours 1; additionalProposers = None
+  now <- getTime
+  rotationCid <- submit env.operator $ createCmd CouncilRotation with
+    operator = env.operator; members = []; threshold = 0; rotationId = "decman"; proposer = env.operator
+    newMembers = [dp]; newThreshold = 1; expiresAt = addRelTime now (days 1); approvals = []; joined = []
+  -- placeholder until the council exists: the formation vote does not use it
+  let d0 = Dm with councilCid = coerceContractId rulesCid; ..
+  joinCid <- submit m1 $ createCmd LendingRotationAction with
+    governanceParty = dp; proposer = m1; operator = env.operator; step = RotationJoin
+    rotationCid = Some rotationCid; councilCid = None; newMembers = [dp]; newThreshold = 1; note = ""
+  passVote d0 (toInterfaceContractId joinCid)
+  [(joined, _)] <- query @CouncilRotation env.operator
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (councilCid, _, _) <- submit env.operator $ exerciseCmd joined Rotation_Execute with
+    executor = env.operator; councilCid = None; configCid; poolCid
+  pure d0 with councilCid
+
+paramsAction : Env -> Dm -> Party -> Text -> (ProtocolConfig -> ProtocolConfig) -> Script (ContractId LendingParamsAction)
+paramsAction env d proposer proposalId f = do
+  (configCid, config) <- currentConfig env
+  let c = f config
+  submit proposer $ createCmd LendingParamsAction with
+    governanceParty = d.dp; proposer; operator = env.operator; councilCid = d.councilCid; configCid; proposalId
+    newParams = c.params; newMarketParams = c.marketParams
+    newTransferFactories = if c.transferFactories == config.transferFactories then None else Some c.transferFactories
+    featuredAppRightChange = None
+    newRoles = if c.roles == config.roles then None else Some c.roles
+    proposalTtl = days 3; note = "test"
+    base = Some ParamsBase with params = config.params; marketParams = config.marketParams
+
+withLtv : N -> ProtocolConfig -> ProtocolConfig
+withLtv ltv c = c with marketParams = Map.alter (fmap (\m -> m with borrowCollateralFactor = ltv)) "CBTC" c.marketParams
+
+-- Formation: one confirmation is not enough, two form the council; the operator alone loses control
+test_decmanFormsCouncil : Script ()
+test_decmanFormsCouncil = do
+  env <- setup
+  d <- setupDm env
+  (configCid, config) <- currentConfig env
+  assertMsg "config governed by the decentralized party" (config.governors == [d.dp])
+  (_, pool) <- currentPool env
+  assertMsg "pool governed by the decentralized party" (pool.governors == [d.dp])
+  submitMustFail env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = None; newRoles = None
+  -- user operations work under the new council
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+
+-- Threshold: one member does not execute, an outsider does not confirm, two members change LTV
+test_decmanParamsByThreshold : Script ()
+test_decmanParamsByThreshold = do
+  env <- setup
+  d <- setupDm env
+  a <- paramsAction env d d.m1 "ltv-45" (withLtv 0.45)
+  let actionCid = toInterfaceContractId @GovernableAction a
+  c1 <- confirm d d.m1 actionCid
+  submitMustFail (as d d.m1) $ executeCmd d d.m1 actionCid [c1]
+  submitMustFail (as d d.outsider) $ exerciseCmd d.rulesCid GovernanceRules_ConfirmAction with
+    confirmer = d.outsider; actionProposalCid = actionCid
+  -- the same member twice does not count as two
+  c1' <- confirm d d.m1 actionCid
+  submitMustFail (as d d.m1) $ executeCmd d d.m1 actionCid [c1, c1']
+  c2 <- confirm d d.m2 actionCid
+  _ <- submit (as d d.m2) $ executeCmd d d.m2 actionCid [c1, c2]
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "LTV changed to 45%" (mp.borrowCollateralFactor == 0.45)
+  results <- query @GovernanceExecutionResult d.dp
+  assertMsg "audit records: formation and the change"
+    (sort (map (\(_, r) -> r.actionLabel) results) == ["LendingCouncilRotation", "LendingParams"])
+
+-- A proposer outside the rules cannot get a confirmation (governance-core)
+test_decmanOutsiderProposalNotConfirmed : Script ()
+test_decmanOutsiderProposalNotConfirmed = do
+  env <- setup
+  d <- setupDm env
+  a <- paramsAction env d d.outsider "ltv-45" (withLtv 0.45)
+  submitMustFail (as d d.m1) $ exerciseCmd d.rulesCid GovernanceRules_ConfirmAction with
+    confirmer = d.m1; actionProposalCid = toInterfaceContractId a
+
+-- A role change needs the operator as well: the vote leaves a proposal, the operator executes it
+test_decmanTrustedChangeWaitsForOperator : Script ()
+test_decmanTrustedChangeWaitsForOperator = do
+  env <- setup
+  d <- setupDm env
+  oracle2 <- allocateParty "Oracle2"
+  a <- paramsAction env d d.m1 "new-oracle" (\c -> c with roles = c.roles with oracle = oracle2)
+  passVote d (toInterfaceContractId a)
+  (configCid, config) <- currentConfig env
+  assertMsg "roles unchanged by the vote alone" (config.roles.oracle == env.oracle)
+  [(proposalCid, p)] <- query @ParameterChangeProposal env.operator
+  assertMsg "proposal by the decentralized party" (p.proposer == d.dp && p.approvals == [d.dp])
+  _ <- submit env.operator $ exerciseCmd proposalCid Proposal_ExecuteTrusted with configCid; pauseCid = None
+  (_, config') <- currentConfig env
+  assertMsg "oracle changed" (config'.roles.oracle == oracle2)
+
+-- UTXO drift: an action computed against a config that has changed since fails; nothing is applied
+test_decmanStaleConfigRejected : Script ()
+test_decmanStaleConfigRejected = do
+  env <- setup
+  d <- setupDm env
+  old <- paramsAction env d d.m1 "ltv-40" (withLtv 0.4)
+  new <- paramsAction env d d.m2 "ltv-30" (withLtv 0.3)
+  passVote d (toInterfaceContractId new)
+  let oldCid = toInterfaceContractId @GovernableAction old
+  c1 <- confirm d d.m1 oldCid
+  c2 <- confirm d d.m3 oldCid
+  submitMustFail (as d d.m1) $ executeCmd d d.m1 oldCid [c1, c2]
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "newer decision kept" (mp.borrowCollateralFactor == 0.3)
+
+-- The proposer cannot point the action at targets the members did not confirm
+test_decmanForeignTargetsRejected : Script ()
+test_decmanForeignTargetsRejected = do
+  env <- setup
+  d <- setupDm env
+  (configCid, config) <- currentConfig env
+  -- another operator in the confirmed fields
+  a <- submit d.m1 $ createCmd LendingParamsAction with
+    governanceParty = d.dp; proposer = d.m1; operator = env.alice; councilCid = d.councilCid; configCid
+    proposalId = "x"; newParams = config.params; newMarketParams = (withLtv 0.45 config).marketParams
+    newTransferFactories = None; featuredAppRightChange = None; newRoles = None; proposalTtl = days 1; note = ""
+    base = None
+  let aCid = toInterfaceContractId @GovernableAction a
+  c1 <- confirm d d.m1 aCid
+  c2 <- confirm d d.m2 aCid
+  submitMustFail (as d d.m1) $ executeCmd d d.m1 aCid [c1, c2]
+  -- a rotation whose contents differ from what the members confirm
+  m4 <- allocateParty "DmMember4"
+  r <- submit d.m1 $ createCmd LendingRotationAction with
+    governanceParty = d.dp; proposer = d.m1; operator = env.operator
+    step = RotationPropose with rotationId = "to-m4"; proposalTtl = days 1
+    rotationCid = None; councilCid = Some d.councilCid; newMembers = [m4]; newThreshold = 1; note = ""
+  passVote d (toInterfaceContractId r)
+  [(rotationCid, _)] <- query @CouncilRotation env.operator
+  j <- submit d.m1 $ createCmd LendingRotationAction with
+    governanceParty = d.dp; proposer = d.m1; operator = env.operator; step = RotationJoin
+    rotationCid = Some rotationCid; councilCid = None; newMembers = [d.dp]; newThreshold = 1; note = ""
+  let jCid = toInterfaceContractId @GovernableAction j
+  j1 <- confirm d d.m1 jCid
+  j2 <- confirm d d.m2 jCid
+  submitMustFail (as d d.m1) $ executeCmd d d.m1 jCid [j1, j2]
+
+-- Preconditions fail at creation, before any vote
+test_decmanEnsure : Script ()
+test_decmanEnsure = do
+  env <- setup
+  d <- setupDm env
+  (configCid, config) <- currentConfig env
+  let base = LendingParamsAction with
+        governanceParty = d.dp; proposer = d.m1; operator = env.operator; councilCid = d.councilCid; configCid
+        proposalId = "p"; newParams = config.params; newMarketParams = config.marketParams
+        newTransferFactories = None; featuredAppRightChange = None; newRoles = None; proposalTtl = days 1; note = ""
+        base = None
+  submitMustFail d.m1 $ createCmd base with newMarketParams = (withLtv 0.9 config).marketParams
+  submitMustFail d.m1 $ createCmd base with proposalTtl = seconds 59
+  submitMustFail d.m1 $ createCmd base with proposalTtl = days 31
+  submitMustFail d.m1 $ createCmd base with proposalId = ""
+  submitMustFail d.m1 $ createCmd base with governanceParty = env.operator
+  submitMustFail d.m1 $ createCmd base with newRoles = Some (config.roles with operator = env.alice)
+  -- the boundaries: exactly 60 seconds and exactly 30 days pass
+  _ <- submit d.m1 $ createCmd base with proposalTtl = seconds 60
+  _ <- submit d.m1 $ createCmd base with proposalTtl = days 30
+  submitMustFail d.m1 $ createCmd LendingIncomeAction with
+    governanceParty = d.dp; proposer = d.m1; operator = env.operator; councilCid = d.councilCid; configCid
+    proposalId = "i"; treasury = env.treasury; reservesAmount = 0.0; proposalTtl = days 1; note = ""
+  pure ()
+
+-- Income: only to the protocol treasury; treasury then executes the proposal
+test_decmanIncome : Script ()
+test_decmanIncome = do
+  env <- setup
+  d <- setupDm env
+  (configCid, _) <- currentConfig env
+  let income treasury = submit d.m1 $ createCmd LendingIncomeAction with
+        governanceParty = d.dp; proposer = d.m1; operator = env.operator; councilCid = d.councilCid; configCid
+        proposalId = "i"; treasury; reservesAmount = 1.0; proposalTtl = days 1; note = ""
+  bad <- income env.alice
+  let badCid = toInterfaceContractId @GovernableAction bad
+  b1 <- confirm d d.m1 badCid
+  b2 <- confirm d d.m2 badCid
+  submitMustFail (as d d.m1) $ executeCmd d d.m1 badCid [b1, b2]
+  ok <- income env.treasury
+  passVote d (toInterfaceContractId ok)
+  [(_, p)] <- query @IncomeProposal env.treasury
+  assertMsg "income proposal for treasury" (p.treasury == env.treasury && p.approvals == [d.dp] && p.reservesAmount == 1.0)
+
+-- A pending proposal is withdrawn by a vote
+test_decmanWithdraw : Script ()
+test_decmanWithdraw = do
+  env <- setup
+  d <- setupDm env
+  oracle2 <- allocateParty "Oracle2"
+  a <- paramsAction env d d.m1 "new-oracle" (\c -> c with roles = c.roles with oracle = oracle2)
+  passVote d (toInterfaceContractId a)
+  [(proposalCid, _)] <- query @ParameterChangeProposal env.operator
+  w <- submit d.m2 $ createCmd LendingWithdrawAction with
+    governanceParty = d.dp; proposer = d.m2; target = ParamsProposal proposalCid; note = "changed our mind"
+  passVote d (toInterfaceContractId w)
+  left <- query @ParameterChangeProposal env.operator
+  assertMsg "proposal withdrawn" (null left)
+
+-- Privacy: member nodes see what the decentralized party sees; it sees no accounts and no pool
+test_decmanSeesNoAccounts : Script ()
+test_decmanSeesNoAccounts = do
+  env <- setup
+  d <- setupDm env
+  seedLiquidity env 10000.0
+  run env env.bob (depositCmd env env.bob "CBTC" 0.1)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  accounts <- query @Account d.dp
+  pools <- query @Pool d.dp
+  assertMsg "no accounts visible" (null accounts)
+  assertMsg "no pool visible" (null pools)
+
+-- Moving away from the decentralized party: it proposes, the new members join, the operator executes
+test_decmanRotatesAway : Script ()
+test_decmanRotatesAway = do
+  env <- setup
+  d <- setupDm env
+  n1 <- allocateParty "NewMember1"
+  n2 <- allocateParty "NewMember2"
+  r <- submit d.m1 $ createCmd LendingRotationAction with
+    governanceParty = d.dp; proposer = d.m1; operator = env.operator
+    step = RotationPropose with rotationId = "away"; proposalTtl = days 1
+    rotationCid = None; councilCid = Some d.councilCid; newMembers = [n1, n2]; newThreshold = 2; note = ""
+  passVote d (toInterfaceContractId r)
+  [(r0, _)] <- query @CouncilRotation env.operator
+  r1 <- submit n1 $ exerciseCmd r0 Rotation_Join with joiner = n1
+  r2 <- submit n2 $ exerciseCmd r1 Rotation_Join with joiner = n2
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  _ <- submit env.operator $ exerciseCmd r2 Rotation_Execute with
+    executor = env.operator; councilCid = Some d.councilCid; configCid; poolCid
+  (_, config) <- currentConfig env
+  assertMsg "new council governs" (config.governors == [n1, n2])
+
+-- Risk 9: the vote on a lower liquidation factor leaves a proposal; a second vote applies it after 2 days
+test_decmanLowerLiquidationFactorWaits : Script ()
+test_decmanLowerLiquidationFactorWaits = do
+  env <- setup
+  d <- setupDm env
+  let lower c = c with marketParams = Map.alter (fmap (\m -> m with liquidateCollateralFactor = 0.6)) "CBTC" c.marketParams
+  a <- paramsAction env d d.m1 "lcf-60" lower
+  passVote d (toInterfaceContractId a)
+  mp <- marketParamsFor env "CBTC"
+  assertMsg "not applied by the vote" (mp.liquidateCollateralFactor == 0.65)
+  [(proposalCid, _)] <- query @ParameterChangeProposal env.operator
+  let applyAction = do
+        (configCid, _) <- currentConfig env
+        submit d.m1 $ createCmd LendingExecuteParamsAction with
+          governanceParty = d.dp; proposer = d.m1; operator = env.operator; proposalCid; configCid
+          proposalId = "lcf-60"; note = ""
+  -- before the delay the confirmed action fails
+  early <- toInterfaceContractId @GovernableAction <$> applyAction
+  c1 <- confirm d d.m1 early
+  c2 <- confirm d d.m2 early
+  submitMustFail (as d d.m2) $ executeCmd d d.m2 early [c1, c2]
+  passTime (days 2)
+  late <- applyAction
+  passVote d (toInterfaceContractId late)
+  mp' <- marketParamsFor env "CBTC"
+  assertMsg "applied after 2 days" (mp'.liquidateCollateralFactor == 0.6)
+
+-- Review 03.10, item 25: DecMan members read a short diff, not the config; a stale base fails
+test_decmanReadableDiff : Script ()
+test_decmanReadableDiff = do
+  env <- setup
+  d <- setupDm env
+  a <- paramsAction env d d.m1 "ltv-45" (withLtv 0.45)
+  views <- queryInterface @GovernableAction d.dp
+  let [view] = [ x | (_, Some x) <- views, x.actionLabel == "LendingParams" ]
+  assertMsg ("diff, got: " <> view.description)
+    ("CBTC borrowCollateralFactor 0.5 -> 0.45" `isInfixOf` view.description)
+  assertMsg "no config dump" (not ("ProtocolParams" `isInfixOf` view.description))
+  -- the config moves on before the vote ends: the confirmed diff no longer applies
+  b <- paramsAction env d d.m1 "ltv-40" (withLtv 0.4)
+  passVote d (toInterfaceContractId a)
+  let bCid = toInterfaceContractId @GovernableAction b
+  c1 <- confirm d d.m1 bCid
+  c2 <- confirm d d.m2 bCid
+  submitMustFail (as d d.m2) $ executeCmd d d.m2 bCid [c1, c2]

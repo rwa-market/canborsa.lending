@@ -1,0 +1,139 @@
+-- | Protocol arithmetic (ADR-001, D4).
+-- Internally we compute in `Numeric 18` with banker's rounding.
+-- At the token boundary (`Decimal`, 10 decimals) we round in the protocol's favour.
+module Lending.Math
+  ( N
+  , toN
+  , fromInt
+  , mulN
+  , mulDown
+  , mulUp
+  , divN
+  , divDown
+  , divUp
+  , compareProduct
+  , floorDecimal
+  , ceilDecimal
+  , expN
+  , secondsPerYear
+  , secondsBetween
+  , minN
+  , maxN
+  , absN
+  ) where
+
+import DA.Numeric (cast, castAndRound, div, epsilon, mul)
+import DA.Time (convertRelTimeToMicroseconds, subTime)
+
+-- | Protocol amounts, indices and rates.
+type N = Numeric 18
+
+-- | Token amount to protocol numbers. Exact: 10 decimals fit into 18.
+toN : Decimal -> N
+toN = cast
+
+fromInt : Int -> N
+fromInt = intToNumeric
+
+mulN : N -> N -> N
+mulN = mul
+
+-- | Product rounded down to 18 decimals (a, b ≥ 0): what the protocol owes, e.g. a deposit.
+mulDown : N -> N -> N
+mulDown a b =
+  let p = mulN a b
+  in if compareProduct a b p == LT then p - epsilon else p
+
+-- | Product rounded up to 18 decimals (a, b ≥ 0): what is owed to the protocol, e.g. a debt.
+mulUp : N -> N -> N
+mulUp a b =
+  let p = mulN a b
+  in if compareProduct a b p == GT then p + epsilon else p
+
+divN : N -> N -> N
+divN a b
+  | b == 0.0 = error "Lending.Math.divN: division by zero"
+  | otherwise = div a b
+
+-- | Division rounded down to 18 decimals (a ≥ 0, b > 0). For scaled amounts the
+-- user receives: supply and repayment (audit N6, rule 6).
+divDown : N -> N -> N
+divDown a b =
+  let r = divN a b
+  in if compareProduct r b a == GT then r - epsilon else r
+
+-- | Division rounded up to 18 decimals (a ≥ 0, b > 0). For scaled amounts the
+-- protocol debits or accrues: supply withdrawal and loan debt (audit N6).
+divUp : N -> N -> N
+divUp a b =
+  let r = divN a b
+  in if compareProduct r b a == LT then r + epsilon else r
+
+-- | Exact comparison of r·b with a for non-negative numbers without overflow.
+-- `div` rounds banker's style, so r differs from the quotient by at most ε;
+-- the sign of r·b − a tells which way. We split the product into integer and fractional
+-- parts: integer parts give an exact Numeric 18, fractional ones an exact Numeric 36 below 1.
+compareProduct : N -> N -> N -> Ordering
+compareProduct r b a
+  | d >= 0.0 = if d > 0.0 || t > 0.0 then GT else EQ
+  | d <= -1.0 = LT
+  | otherwise = compare t (cast (negate d))
+  where
+    ri = floorN r
+    rf = r - ri
+    bi = floorN b
+    bf = b - bi
+    d = mulN ri bi + mulN ri bf + mulN rf bi - a
+    t : Numeric 36
+    t = mul rf bf
+
+-- | Integer part of a non-negative number.
+floorN : N -> N
+floorN x =
+  let r : Numeric 0 = castAndRound x
+      r' : N = cast r
+  in if r' > x then r' - 1.0 else r'
+
+-- | Down to 10 decimals: this is how we compute what the protocol pays out.
+floorDecimal : N -> Decimal
+floorDecimal x =
+  let r : Decimal = castAndRound x
+  in if (cast r : N) > x then r - epsilon else r
+
+-- | Up to 10 decimals: this is how we compute what the user pays.
+ceilDecimal : N -> Decimal
+ceilDecimal x =
+  let r : Decimal = castAndRound x
+  in if (cast r : N) < x then r + epsilon else r
+
+-- | e^x for x ≥ 0: for x > 0.25 halve and square, otherwise a series up to x^8/8!.
+-- Relative error below 1e-12 for any x the parameters allow (rate ≤ 500%).
+expN : N -> N
+expN x
+  | x > 0.25 = let h = expN (divN x 2.0) in mulN h h
+  | otherwise = expGo x 1.0 1.0 1
+
+expGo : N -> N -> N -> Int -> N
+expGo x acc term k
+  | k > 8 = acc
+  | otherwise =
+      let term' = divN (mulN term x) (fromInt k)
+      in expGo x (acc + term') term' (k + 1)
+
+secondsPerYear : N
+secondsPerYear = 31536000.0
+
+-- | Seconds between two ledger-time moments, not below zero.
+secondsBetween : Time -> Time -> N
+secondsBetween from to =
+  let micros = convertRelTimeToMicroseconds (subTime to from)
+  in if micros <= 0 then 0.0 else divN (fromInt micros) 1000000.0
+
+minN : N -> N -> N
+minN a b = if a <= b then a else b
+
+maxN : N -> N -> N
+maxN a b = if a >= b then a else b
+
+absN : N -> N
+absN a = if a < 0.0 then negate a else a

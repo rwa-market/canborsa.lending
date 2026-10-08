@@ -1,0 +1,385 @@
+-- | Account under an EVM wallet (0.5.0, ADR-004). The user logs in with MetaMask, Coinbase Wallet
+-- or another EVM wallet: they have no party of their own on Canton. Their account is a subaccount
+-- of the protocol's custodial party, and they sign each operation with the wallet key
+-- (EIP-191, personal_sign). The contract checks the signature: the message text is built here
+-- from the operation arguments, the key is recovered off-ledger and checked against the account address.
+--
+-- The message is bound to the network, operator, address, action, nonce and expiry: a signature
+-- does not carry over to another operation, another pool or another network; the nonce cuts off replays.
+--
+-- The user's tokens sit as holdings of the custodial party; user shares are tracked by
+-- EvmWallet.balances. Trust in the custodian is described in ADR-004.
+--
+-- 0.6.0, real assets: crediting a deposit by transfer reason (EvmWallet_ReceiveAttributed)
+-- and a deposit as holdings without a transfer (EvmWallet_CreditDeposit, Lending.EvmDeposit); withdrawal to
+-- a Canton party (EvmTransferOut) and a request to withdraw USDCx to Ethereum (EvmRedeem,
+-- Lending.EvmRedeem). Both withdrawals are executed by Pool_EvmWalletExecute with the wallet signature.
+module Lending.Evm
+  ( EvmWallet (..)
+  , EvmAction (..)
+  , EvmSignature (..)
+  , EvmWallet_Receive (..)
+  , EvmWallet_ReceiveAttributed (..)
+  , EvmWallet_ReclaimTransferOut (..)
+  , EvmWallet_DropInstrument (..)
+  , EvmWallet_CreditDeposit (..)
+  , depositReasonKey
+  , evmDepositReason
+  , checkDepositReason
+  , acceptIncoming
+  , maxSignatureTtl
+  , debitIn
+  , evmMessage
+  , actionLine
+  , checkEvmSignature
+  , consumeEvmSignature
+  , personalDigest
+  , addressOfKey
+  , derSignature
+  , isEvmAddress
+  , balanceOf
+  , credit
+  , debit
+  , secp256k1HalfOrder
+  ) where
+
+import DA.Action (unless)
+import DA.List (unique)
+import DA.Crypto.Text (BytesHex, keccak256, secp256k1WithEcdsaOnly, toHex)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set qualified as Set
+import DA.Text qualified as T
+import DA.TextMap qualified as TextMap
+import DA.Time (RelTime, addRelTime, minutes)
+import Splice.Api.Token.HoldingV1 (Holding, InstrumentId (..))
+import Splice.Api.Token.MetadataV1 (ExtraArgs, Metadata (..))
+import Splice.Api.Token.TransferInstructionV1
+
+import Lending.Config (ProtocolConfig (..), governedConfig, requireInstrumentDelisted)
+import Lending.EvmDeposit
+import Lending.Token (ownHolding, verifyReceived)
+import Lending.Types
+
+-- | Operation the user signs (K2). Amounts in the token's 10 decimals. Withdraw and Borrow are
+-- different texts (risk 7): a withdrawal never turns into a loan without the user seeing it.
+data EvmAction
+  = EvmSupply with amount : Decimal; full : Bool
+      -- ^ supply USDCx: repays the debt first, the rest is a deposit. full: repay the whole
+      --   debt; amount is then the cap the user is willing to pay
+  | EvmWithdraw with amount : Decimal; full : Bool
+      -- ^ withdraw from the deposit, never below 0. full: the whole deposit; amount unused, only > 0
+  | EvmBorrow with amount : Decimal
+      -- ^ withdraw with borrowing allowed: the deposit first, then a debt
+  | EvmDepositCollateral with marketId : MarketId; amount : Decimal
+  | EvmWithdrawCollateral with marketId : MarketId; amount : Decimal
+  | EvmTransferOut with instrumentId : InstrumentId; amount : Decimal; receiver : Party
+      -- ^ 0.6.0: transfer free balance to a Canton party through the trusted factory
+  | EvmRedeem with amount : Decimal; ethAddress : Text; requestId : Text
+      -- ^ 0.6.0: request to withdraw USDCx to Ethereum (burn in xReserve). amount: up to 6 decimals,
+      --   ethAddress: 0x and 40 lowercase hex, requestId: the backend's request id (not
+      --   part of the signature)
+  deriving (Eq, Show)
+
+-- | Wallet signature over the operation message.
+data EvmSignature = EvmSignature
+  with
+    publicKey : Text
+      -- ^ uncompressed key without the 04 prefix: x and y, 128 hex. Recovered by the backend (ecrecover)
+    r : Text
+      -- ^ 64 hex
+    s : Text
+      -- ^ 64 hex, lower half of the curve order (EIP-2)
+    nonce : Int
+      -- ^ equals EvmWallet.nonce
+    expiresAt : Time
+      -- ^ the signature is not accepted after this; no later than maxSignatureTtl from ledger time
+  deriving (Eq, Show)
+
+-- | EVM user's wallet: address, signature nonce and shares in the custodian's holdings.
+-- Visible to the operator and the custodian; other users do not see it.
+template EvmWallet
+  with
+    operator : Party
+    custody : Party
+      -- ^ party that owns the holdings and the user's Account
+    address : Text
+      -- ^ lowercase EVM address, 0x and 40 hex
+    network : Text
+      -- ^ Canton network in the signed message, e.g. canton:devnet
+    nonce : Int
+      -- ^ the next signature must carry this nonce
+    balances : Map InstrumentId Decimal
+      -- ^ the user's free tokens, which the custodian holds as holdings
+  where
+    signatory operator, custody
+    ensure isEvmAddress address && nonce >= 0 && all (>= 0.0) (Map.values balances)
+
+    -- | Credit an incoming transfer (faucet, transfer from another party) to the wallet.
+    -- The custodian accepts the transfer and receives the holdings; no user signature is needed:
+    -- the user only receives tokens.
+    choice EvmWallet_Receive : ContractId EvmWallet
+      with
+        instructionCid : ContractId TransferInstruction
+        extraArgs : ExtraArgs
+      controller custody
+      do
+        t <- acceptIncoming custody instructionCid extraArgs (\_ -> pure ())
+        create this with balances = credit t.instrumentId t.amount balances
+
+    -- | 0.6.0: credit an incoming transfer only if its reason points to this wallet:
+    -- meta["splice.lfdecentralizedtrust.org/reason"] == "lending:evm:<address>". Without a reason
+    -- or with another reason it is rejected: the backend does not credit such a transfer automatically (quarantine).
+    choice EvmWallet_ReceiveAttributed : ContractId EvmWallet
+      with
+        instructionCid : ContractId TransferInstruction
+        extraArgs : ExtraArgs
+      controller custody
+      do
+        t <- acceptIncoming custody instructionCid extraArgs \t ->
+          either abort pure (checkDepositReason address t.meta)
+        create this with balances = credit t.instrumentId t.amount balances
+
+    -- | 0.8.0: drop the balance of an instrument the council removed with its market (Delisting_Execute).
+    -- The custodian's holdings of it are written off outside the protocol.
+    choice EvmWallet_DropInstrument : ContractId EvmWallet
+      with
+        governors : [Party]
+        configCid : ContractId ProtocolConfig
+        instrument : InstrumentId
+      controller operator :: governors
+      do
+        config <- governedConfig operator governors configCid
+        requireInstrumentDelisted config instrument
+        unless (Map.member instrument balances) (abort "no balance of this instrument")
+        create this with balances = Map.delete instrument balances
+
+    -- | 0.6.0: withdraw this wallet's outgoing transfer that the receiver did not accept (two-step
+    -- transfer, EvmTransferOut returned an instruction). The custodian takes the holdings back from the registry,
+    -- the amount returns to the balance. A receiver rejection (Reject) returns the holdings
+    -- to the custodian outside this choice, see ADR-005.
+    choice EvmWallet_ReclaimTransferOut : ContractId EvmWallet
+      with
+        instructionCid : ContractId TransferInstruction
+        extraArgs : ExtraArgs
+      controller custody
+      do
+        instruction <- fetch instructionCid
+        let t = (view instruction).transfer
+        unless (t.sender == custody) (abort "transfer was not sent by the custody party")
+        unless (checkDepositReason address t.meta == Right ())
+          (abort "transfer was not sent from this EVM wallet")
+        result <- exercise instructionCid TransferInstruction_Withdraw with extraArgs
+        case result.output of
+          TransferInstructionResult_Failed -> pure ()
+          _ -> abort "withdrawn transfer did not return the tokens"
+        verifyReceived t.instrumentId custody t.amount result.senderChangeCids
+        create this with balances = credit t.instrumentId t.amount balances
+
+    -- | 0.6.0: credit a deposit that reached the custodian as holdings without a TransferInstruction:
+    -- an xReserve mint (BridgeUserAgreement_Mint by DepositAttestation) or CC to the custodian with
+    -- TransferPreapproval. Whose deposit it is, the backend establishes off-ledger (deposit event on
+    -- Ethereum, memo in the Canton transaction); the contract checks:
+    --   instrumentId: an instrument with a trusted factory in ProtocolConfig (asset profile);
+    --   holdingCids: the custodian's free holdings of this instrument, signed by the registry,
+    --     totalling at least amount (holdings are not spent or marked);
+    --   depositRef: non-empty deposit id: an Ethereum transaction hash (0x and 64 lowercase
+    --     hex, other case is rejected) or "<updateId>:<eventId>" of a Canton transaction;
+    --   replay: depositRef is not yet in the custodian's DepositRegistry; the choice adds it there.
+    --     There is one registry per custodian and every credit re-creates it, so one deposit
+    --     cannot be credited twice, neither to one wallet nor to two different ones.
+    choice EvmWallet_CreditDeposit : (ContractId EvmWallet, ContractId DepositRegistry, ContractId DepositClaim)
+      with
+        configCid : ContractId ProtocolConfig
+          -- ^ operator's config: trusted factories are the profile's instruments
+        registryCid : ContractId DepositRegistry
+        holdingCids : [ContractId Holding]
+        instrumentId : InstrumentId
+        amount : Decimal
+        depositRef : Text
+      controller custody
+      do
+        unless (amount > 0.0) (abort "amount must be positive")
+        unless (validDepositRef depositRef) (abort "deposit reference must be non-empty; an Ethereum hash must be lowercase 0x and 64 hex")
+        unless (not (null holdingCids)) (abort "holdings required")
+        unless (unique holdingCids) (abort "duplicate holdings")
+        config <- fetch configCid
+        unless (config.roles.operator == operator) (abort "config belongs to another operator")
+        unless (Map.member instrumentId config.transferFactories) (abort "instrument has no trusted transfer factory")
+        registry <- fetch registryCid
+        unless (registry.operator == operator && registry.custody == custody) (abort "deposit registry of another custody party")
+        unless (not (Set.member depositRef registry.refs)) (abort "deposit already credited")
+        amounts <- forA holdingCids (ownHolding instrumentId custody)
+        unless (sum amounts >= amount) (abort "holdings below the credited amount")
+        archive registryCid
+        registryCid' <- create registry with refs = Set.insert depositRef registry.refs
+        now <- getTime
+        claimCid <- create DepositClaim with
+          operator; custody; address; instrumentId; amount; depositRef; claimedAt = now
+        walletCid' <- create this with balances = credit instrumentId amount balances
+        pure (walletCid', registryCid', claimCid)
+
+
+-- | Accept a transfer to the custodian after the `check` and return it.
+acceptIncoming : Party -> ContractId TransferInstruction -> ExtraArgs -> (Transfer -> Update ()) -> Update Transfer
+acceptIncoming custody instructionCid extraArgs check = do
+  instruction <- fetch instructionCid
+  let t = (view instruction).transfer
+  unless (t.receiver == custody) (abort "transfer is not addressed to the custody party")
+  unless (t.amount > 0.0) (abort "transfer amount must be positive")
+  check t
+  result <- exercise instructionCid TransferInstruction_Accept with extraArgs
+  received <- case result.output of
+    TransferInstructionResult_Completed cids -> pure cids
+    _ -> abort "incoming transfer did not complete"
+  verifyReceived t.instrumentId custody t.amount received
+  pure t
+
+-- | Reason key in Transfer.meta (CIP-0056): transfer description from the sender's wallet.
+depositReasonKey : Text
+depositReasonKey = "splice.lfdecentralizedtrust.org/reason"
+
+-- | Reason of a deposit to an address's wallet: lending:evm:<lowercase address>.
+evmDepositReason : Text -> Text
+evmDepositReason address = "lending:evm:" <> address
+
+-- | The transfer reason points to the address's wallet. Left: why not.
+checkDepositReason : Text -> Metadata -> Either Text ()
+checkDepositReason address meta = case TextMap.lookup depositReasonKey meta.values of
+  None -> Left "incoming transfer has no deposit reason"
+  Some reason
+    | reason == evmDepositReason address -> Right ()
+    | otherwise -> Left "deposit reason does not match this EVM wallet"
+
+-- | Maximum signature lifetime: a message with an expiry beyond this is not accepted.
+maxSignatureTtl : RelTime
+maxSignatureTtl = minutes 30
+
+-- | Check the operation signature and return the wallet with the next nonce (the contract is archived).
+-- The calling choice re-creates the wallet with new balances.
+consumeEvmSignature
+  : Party -> Party -> ContractId EvmWallet -> Text -> EvmSignature -> Update EvmWallet
+consumeEvmSignature operator custody walletCid line sig = do
+  wallet <- fetch walletCid
+  unless (wallet.operator == operator) (abort "EVM wallet of another operator")
+  unless (wallet.custody == custody) (abort "EVM wallet of another custody party")
+  now <- getTime
+  unless (now <= sig.expiresAt) (abort "EVM signature expired")
+  unless (sig.expiresAt <= addRelTime now maxSignatureTtl) (abort "EVM signature lifetime exceeds 30 minutes")
+  unless (sig.nonce == wallet.nonce) (abort "EVM signature nonce is stale: sign the operation again")
+  let message = evmMessage wallet.network operator wallet.address line sig.nonce sig.expiresAt
+  either abort pure (checkEvmSignature wallet.address message sig)
+  archive walletCid
+  pure wallet with nonce = wallet.nonce + 1
+
+-- | Signature of the message by the address key. Left: why not.
+checkEvmSignature : Text -> Text -> EvmSignature -> Either Text ()
+checkEvmSignature address message sig
+  | not (isHexOf 128 sig.publicKey) = Left "EVM public key must be 128 lowercase hex characters"
+  | not (isHexOf 64 sig.r) || not (isHexOf 64 sig.s) = Left "EVM signature r and s must be 64 lowercase hex characters"
+  | sig.r == zero32 || sig.s == zero32 = Left "EVM signature r and s must be non-zero"
+  | sig.s > secp256k1HalfOrder = Left "EVM signature s must be in the lower half of the curve order (EIP-2)"
+  | addressOfKey sig.publicKey /= address = Left "EVM signature key does not match the account address"
+  | not (secp256k1WithEcdsaOnly (derSignature sig.r sig.s) (personalDigest message) (spkiOf sig.publicKey)) =
+      Left "EVM signature does not match the operation"
+  | otherwise = Right ()
+  where zero32 = T.implode (replicate 64 "0")
+
+-- | Text for personal_sign. The frontend builds the same text itself and checks it against the backend
+-- (packages/shared/src/evm.ts); a Daml test holds the shared vector.
+evmMessage : Text -> Party -> Text -> Text -> Int -> Time -> Text
+evmMessage network operator address line nonce expiresAt = T.intercalate "\n"
+  [ "Canton Lending"
+  , line
+  , "Account: " <> address
+  , "Network: " <> network
+  , "Operator: " <> partyToText operator
+  , "Nonce: " <> show nonce
+  , "Expires: " <> show expiresAt
+  ]
+
+-- | Action string. debtSymbol: id of the debt instrument (USDCx).
+actionLine : Text -> EvmAction -> Text
+actionLine debt action = case action of
+  EvmSupply with amount; full
+    | full -> "Repay all " <> debt <> " debt, up to " <> show amount
+    | otherwise -> "Supply " <> show amount <> " " <> debt
+  EvmWithdraw with amount; full
+    | full -> "Withdraw all " <> debt
+    | otherwise -> "Withdraw " <> show amount <> " " <> debt
+  EvmBorrow with amount -> "Borrow " <> show amount <> " " <> debt
+  EvmDepositCollateral with marketId; amount -> "Deposit " <> show amount <> " " <> marketId <> " as collateral"
+  EvmWithdrawCollateral with marketId; amount -> "Withdraw " <> show amount <> " " <> marketId <> " collateral"
+  EvmTransferOut with instrumentId; amount; receiver ->
+    "Send " <> show amount <> " " <> instrumentId.id <> " to " <> partyToText receiver
+  EvmRedeem with amount; ethAddress ->
+    "Redeem " <> show amount <> " " <> debt <> " to Ethereum " <> ethAddress
+
+-- | EIP-191 hash (personal_sign): keccak256("\x19Ethereum Signed Message:\n" ++ length ++ text).
+personalDigest : Text -> BytesHex
+personalDigest message =
+  let body = toHex message
+      len = T.length body / 2
+  in keccak256 ("19457468657265756d205369676e6564204d6573736167653a0a" <> toHex (show len) <> body)
+
+-- | EVM address of the key: the last 20 bytes of keccak256(x ++ y).
+addressOfKey : Text -> Text
+addressOfKey xy = "0x" <> T.drop 24 (keccak256 xy)
+
+-- | secp256k1 key in SubjectPublicKeyInfo DER (uncompressed point).
+spkiOf : Text -> Text
+spkiOf xy = "3056301006072a8648ce3d020106052b8104000a034200" <> "04" <> xy
+
+-- | Signature (r, s) in DER: SEQUENCE { INTEGER r, INTEGER s }.
+derSignature : Text -> Text -> Text
+derSignature r s =
+  let body = derInteger r <> derInteger s
+  in "30" <> hexByte (T.length body / 2) <> body
+
+-- | DER INTEGER from 32 bytes: no leading zero bytes, with 00 if the high bit is 1.
+derInteger : Text -> Text
+derInteger h =
+  let trimmed = dropZeroBytes h
+      padded = if T.take 1 trimmed `elem` ["8", "9", "a", "b", "c", "d", "e", "f"] then "00" <> trimmed else trimmed
+  in "02" <> hexByte (T.length padded / 2) <> padded
+
+dropZeroBytes : Text -> Text
+dropZeroBytes h
+  | T.length h > 2 && T.take 2 h == "00" = dropZeroBytes (T.drop 2 h)
+  | otherwise = h
+
+hexByte : Int -> Text
+hexByte n = hexDigit (n / 16) <> hexDigit (n % 16)
+  where hexDigit d = T.substring d 1 "0123456789abcdef"
+
+-- | n/2 of the secp256k1 order: s above it is the second, "mirror" form of the same signature.
+secp256k1HalfOrder : Text
+secp256k1HalfOrder = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0"
+
+isHexOf : Int -> Text -> Bool
+isHexOf n t = T.length t == n && all (`elem` hexChars) (T.explode t)
+
+hexChars : [Text]
+hexChars = T.explode "0123456789abcdef"
+
+-- | 0x and 40 lowercase hex: in the message and in keys the address is always in this form.
+isEvmAddress : Text -> Bool
+isEvmAddress a = T.take 2 a == "0x" && isHexOf 40 (T.drop 2 a)
+
+balanceOf : InstrumentId -> Map InstrumentId Decimal -> Decimal
+balanceOf i b = fromOptional 0.0 (Map.lookup i b)
+
+credit : InstrumentId -> Decimal -> Map InstrumentId Decimal -> Map InstrumentId Decimal
+credit i amount b = Map.insert i (balanceOf i b + amount) b
+
+-- | Debit the user's balance; below zero is rejected.
+debit : InstrumentId -> Decimal -> Map InstrumentId Decimal -> Update (Map InstrumentId Decimal)
+debit = debitIn "EVM wallet"
+
+-- | Debit the balance of wallet `wallet` (in the rejection text: EVM wallet, Loop wallet).
+debitIn : Text -> InstrumentId -> Decimal -> Map InstrumentId Decimal -> Update (Map InstrumentId Decimal)
+debitIn wallet i amount b = do
+  let left = balanceOf i b - amount
+  unless (left >= 0.0) (abort ("insufficient " <> i.id <> " in the " <> wallet))
+  pure (Map.insert i left b)

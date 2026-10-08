@@ -1,0 +1,87 @@
+-- | T1.7.1 Featured App markers (§10): one marker per completed money operation,
+-- none on prices, parameters, pauses and rejected operations.
+module Test.Lending.RewardsTest where
+
+import Daml.Script
+
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight)
+
+import Lending.Config
+import Lending.Types (PauseFlags (..))
+import Test.Lending.Env
+import Test.Lending.MockRewards
+
+enableRewards : Env -> Party -> Script ()
+enableRewards env provider = do
+  dso <- allocateParty "DSO"
+  right <- submit dso $ createCmd MockFeaturedAppRight with dso; provider
+  (configCid, config) <- currentConfig env
+  _ <- submit env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = Some (toInterfaceContractId @FeaturedAppRight right); newRoles = None
+  pure ()
+
+markers : Env -> Script Int
+markers env = length <$> query @MockActivityMarker env.operator
+
+-- | The operation adds exactly `n` markers.
+expectMarkers : Env -> Int -> Script () -> Script ()
+expectMarkers env n action = do
+  before <- markers env
+  action
+  after <- markers env
+  assertMsg ("expected " <> show n <> " marker(s), got " <> show (after - before)) (after - before == n)
+
+test_markersOnEconomicOperations : Script ()
+test_markersOnEconomicOperations = do
+  env <- setup
+  seedLiquidity env 20000.0
+  enableRewards env env.operator
+  expectMarkers env 1 $ run env env.alice (supplyCmd env env.alice 100.0)
+  expectMarkers env 1 $ run env env.alice (withdrawCmd env env.alice 100.0)
+  expectMarkers env 1 $ run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  expectMarkers env 1 $ run env env.bob (withdrawCollateralCmd env env.bob "CC" 100.0)
+  expectMarkers env 1 $ run env env.bob (borrowCmd env env.bob 1000.0)
+  expectMarkers env 1 $ run env env.bob (supplyCmd env env.bob 250.0)
+  -- 19 900 CC × $0.08 × 0.45 = 716.4 < 750 of debt: absorb moves no tokens, the sale does
+  setPrice env env.cc 0.08
+  expectMarkers env 0 $ absorb env env.bob
+  mint env env.usdcx env.liquidator 2000.0
+  expectMarkers env 1 $ run env env.liquidator (buyCmd env env.liquidator "CC" 1000.0 0.0)
+  (_, m) <- queryFilter @MockActivityMarker env.operator (const True) >>= \case
+    (x :: _) -> pure x
+    [] -> abort "no markers"
+  assertMsg "operator is the beneficiary" (m.beneficiary == env.operator && m.weight == 1.0)
+
+test_noMarkersOnNonEconomicActions : Script ()
+test_noMarkersOnNonEconomicActions = do
+  env <- setup
+  enableRewards env env.operator
+  seedLiquidity env 1000.0
+  expectMarkers env 0 $ setPrice env env.cc 0.25
+  expectMarkers env 0 $ setPauseFlags env (\f -> f with borrowPaused = True)
+  expectMarkers env 0 $ updateParams env identity []
+  -- rejected operation: borrow while paused
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  expectMarkers env 0 $ mustFail env env.bob (borrowCmd env env.bob 250.0)
+
+-- Another provider's right: 0.4.0 rejects it already when it is set (Config_Update),
+-- before that, only in each operation. Operations without the right proceed, with no markers.
+test_foreignRightRejected : Script ()
+test_foreignRightRejected = do
+  env <- setup
+  stranger <- allocateParty "OtherApp"
+  dso <- allocateParty "DSO"
+  right <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = stranger
+  (configCid, config) <- currentConfig env
+  -- the operator is not a stakeholder of another's right: fetch at setting time is rejected even with disclosure
+  submitMustFail env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = Some (toInterfaceContractId @FeaturedAppRight right); newRoles = None
+  Some d <- queryDisclosure stranger right
+  submitMustFail (actAs env.operator <> disclose d) $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = Some (toInterfaceContractId @FeaturedAppRight right); newRoles = None
+  (_, unchanged) <- currentConfig env
+  assertMsg "right not installed" (unchanged.featuredAppRight == None)
+  expectMarkers env 0 $ run env env.alice (supplyCmd env env.alice 100.0)

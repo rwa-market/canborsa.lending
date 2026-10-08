@@ -1,0 +1,140 @@
+-- | User account (K1): one signed USDCx balance and collateral per asset.
+-- Signed by the operator; the user sees only their own account.
+-- One account per user is held by AccountDirectory, which nobody receives
+-- through disclosure: the user list does not leak (audit V1).
+module Lending.Account where
+
+import DA.Action (unless)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import Lending.Config (ProtocolConfig (..), governedConfig)
+import Lending.Evm
+import Lending.Math
+import Lending.Types
+
+template Account
+  with
+    operator : Party
+    owner : Party
+    principal : N
+      -- ^ USDCx balance in principal units (K1): positive is a deposit (× supplyIndex),
+      --   negative is a debt (× borrowIndex). One debt per account, backed by all collateral
+    collateral : Map MarketId N
+      -- ^ collateral per asset, in asset units; all of it backs the debt
+    evmAddress : Optional Text
+      -- ^ 0.5.0, ADR-004: Some: an EVM user's account under the custodial party `owner`.
+      --   Operations on it go only with the wallet signature (Pool_EvmExecute)
+    loopParty : Optional Text
+      -- ^ 0.7.0: Some: a Loop wallet user's account (their external party id as text) under
+      --   the custodial party `owner`. Operations on it go only through Pool_LoopWalletExecute
+  where
+    signatory operator
+    observer owner
+    ensure all (>= 0.0) (Map.values collateral)
+
+    -- | Drop the collateral of an asset the council removed (Delisting_Execute). The collateral is
+    -- written off with the asset; an account with debt is not touched.
+    choice Account_DropMarket : ContractId Account
+      with
+        governors : [Party]
+        configCid : ContractId ProtocolConfig
+        marketId : MarketId
+      controller operator :: governors
+      do
+        config <- governedConfig operator governors configCid
+        unless (not (Map.member marketId config.marketParams)) (abort "market is still listed")
+        unless (Map.member marketId collateral) (abort ("no collateral on market " <> marketId))
+        unless (principal >= 0.0) (abort "account has debt: its collateral cannot be dropped")
+        create this with collateral = Map.delete marketId collateral
+
+-- | Account request. The operator opens the account if the user does not have one yet.
+template AccountRequest
+  with
+    operator : Party
+    user : Party
+  where
+    signatory user
+    observer operator
+
+    choice AccountRequest_Cancel : ()
+      controller user
+      do pure ()
+
+    -- | Close the request: called by AccountDirectory on open or rejection.
+    choice AccountRequest_Consume : Party
+      controller operator
+      do pure user
+
+-- | Registry of account owners. Visible only to the operator.
+-- Re-audit L7 (accepted): the set is rewritten on every open. Without contract
+-- keys only it proves the account does not exist yet; a per-user marker does not give that.
+template AccountDirectory
+  with
+    operator : Party
+    holders : Set Party
+  where
+    signatory operator
+
+    choice Directory_Open : (ContractId AccountDirectory, ContractId Account)
+      with
+        requestCid : ContractId AccountRequest
+      controller operator
+      do
+        request <- fetch requestCid
+        unless (request.operator == operator) (abort "request for another operator")
+        unless (not (Set.member request.user holders)) (abort "account already exists")
+        user <- exercise requestCid AccountRequest_Consume
+        accountCid <- create Account with
+          operator; owner = user; principal = 0.0; collateral = Map.empty; evmAddress = None
+          loopParty = None
+        directoryCid <- create this with holders = Set.insert user holders
+        pure (directoryCid, accountCid)
+
+    -- | Reject a repeated request: the user already has an account.
+    nonconsuming choice Directory_Reject : ()
+      with
+        requestCid : ContractId AccountRequest
+      controller operator
+      do
+        request <- fetch requestCid
+        unless (Set.member request.user holders) (abort "user has no account: open it instead")
+        _ <- exercise requestCid AccountRequest_Consume
+        pure ()
+
+-- | Registry of the custodial party's EVM accounts (0.5.0, ADR-004): one Account and one
+-- EvmWallet per address. Signed by the operator and the custodian, visible only to them.
+template EvmDirectory
+  with
+    operator : Party
+    custody : Party
+    network : Text
+      -- ^ Canton network in signed messages, e.g. canton:devnet
+    addresses : Set Text
+  where
+    signatory operator, custody
+    ensure operator /= custody && network /= ""
+
+    -- | Open an account for an address. The backend checks the address signature at login; the account itself is empty
+    -- and does nothing without a signature, so the operator opens it.
+    choice EvmDirectory_Open : (ContractId EvmDirectory, ContractId Account, ContractId EvmWallet)
+      with
+        address : Text
+      controller operator
+      do
+        unless (isEvmAddress address) (abort "not a lowercase 0x EVM address")
+        unless (not (Set.member address addresses)) (abort "EVM account already exists")
+        accountCid <- create Account with
+          operator; owner = custody; principal = 0.0; collateral = Map.empty
+          evmAddress = Some address; loopParty = None
+        walletCid <- create EvmWallet with
+          operator; custody; address; network; nonce = 0; balances = Map.empty
+        directoryCid <- create this with addresses = Set.insert address addresses
+        pure (directoryCid, accountCid, walletCid)
+
+-- | Collateral of an asset, or 0.
+collateralOf : MarketId -> Account -> N
+collateralOf marketId account = fromOptional 0.0 (Map.lookup marketId account.collateral)

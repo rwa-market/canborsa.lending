@@ -1,0 +1,217 @@
+-- | Protocol deployment on real assets: TestNet and MainNet (audit D-1).
+--
+-- Unlike Test.Lending.Deploy (DevNet), the script does not create token registries,
+-- does not mint tokens and does not set a mock Featured App right. Role parties, asset
+-- InstrumentIds with their admin, trusted factories from the registry API and the DSO come in the input JSON.
+--
+-- Run (infra, scripts/deploy-testnet.sh):
+--   dpm script --dar lending-deploy-<version>.dar --script-name Lending.Deploy.Prod:deployProd \
+--     --input-file prod-input.json --output-file backend/deployment.json ...
+-- Output has the same shape as backend/deployment.json from Test.Lending.Deploy.
+--
+-- What is created: ProtocolConfig (with DSO), Pool, PauseState, AccountDirectory, a PriceFeed per asset
+-- and a ReserveAttestation for CBTC. Feeds and the attestation are created deliberately stale: borrowing,
+-- collateral withdrawal and absorb will not go through until the oracle bot publishes real prices.
+-- Starting reserves (15 000 USDCx, the former Insurance Fund) are added by treasury: Pool_AddReserves.
+-- Council: a CouncilRotation with an empty old council. Members sign Rotation_Join with their own
+-- key, after which the council adopts the config and the pool (executeCouncilFormation).
+module Lending.Deploy.Prod where
+
+import DA.Action (foldlA, unless)
+import DA.Foldable (forA_)
+import DA.Map qualified as Map
+import DA.Set qualified as Set
+import DA.Time (addRelTime, days, hours)
+import Daml.Script
+
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.TransferInstructionV1 (TransferFactory)
+
+import Lending.Account
+import Lending.Config
+import Lending.Governance
+import Lending.Math
+import Lending.Oracle
+import Lending.Pause
+import Lending.Pool
+import Lending.Types
+
+-- | Asset: the registry InstrumentId and its TransferFactory (from the registry API, e.g.
+-- ExternalPartyAmuletRules for CC). The council changes the factory later (Proposal_ExecuteTrusted).
+data AssetInput = AssetInput
+  with
+    instrument : InstrumentId
+    transferFactory : ContractId TransferFactory
+    bootstrapPrice : Decimal
+      -- ^ USD per unit for the initial feed; the feed is created stale (see above)
+  deriving (Eq, Show)
+
+-- | deployProd input (--input-file).
+data ProdInput = ProdInput
+  with
+    operator : Party
+    oracle : Party
+    guardian : Party
+    treasury : Party
+    backstop : Party
+    liquidators : [Party]
+    usdcx : AssetInput
+    cc : AssetInput
+    cbtc : AssetInput
+    dso : Party
+      -- ^ network DSO: the config will not accept a Featured App right from another party
+    featuredAppRight : Optional (ContractId FeaturedAppRight)
+      -- ^ right from the DSO, if already issued; otherwise the operator sets it later
+      --   (Config_SetFeaturedAppRight)
+    council : [Party]
+      -- ^ council members; empty: config without a council (not for MainNet)
+    councilThreshold : Int
+    councilHostedHere : Bool
+      -- ^ council members are on this node and available to the script: it signs Rotation_Join itself
+      --   and adopts the council. False: members sign with their own key, then
+      --   executeCouncilFormation
+    params : Optional ProtocolParams
+      -- ^ None: prodProtocolParams
+    ccMarket : Optional MarketParams
+      -- ^ None — ccMarketParams
+    cbtcMarket : Optional MarketParams
+      -- ^ None — cbtcMarketParams
+  deriving (Eq, Show)
+
+-- | deployProd output (--output-file): backend/deployment.json fields plus council and DSO.
+data ProdDeployment = ProdDeployment
+  with
+    operator : Party
+    oracle : Party
+    guardian : Party
+    treasury : Party
+    backstop : Party
+    liquidator : Party
+      -- ^ the first liquidator: the backend addresses requests to it
+    liquidators : [Party]
+    testers : [Party]
+      -- ^ always empty: there are no test accounts on real assets
+    usdcx : InstrumentId
+    cc : InstrumentId
+    cbtc : InstrumentId
+    dso : Party
+    council : [Party]
+    councilThreshold : Int
+    councilRotationId : Optional Text
+      -- ^ id of the council formation rotation, if the council is not adopted yet
+  deriving (Eq, Show)
+
+-- | Id of the rotation that forms the first council.
+formationId : Text
+formationId = "council-formation"
+
+deployProd : ProdInput -> Script ProdDeployment
+deployProd input = do
+  let op = input.operator
+      roles = Roles with
+        operator = op; oracle = input.oracle; guardian = input.guardian
+        treasury = input.treasury; backstop = input.backstop; liquidators = input.liquidators
+      params = optional (prodProtocolParams input.usdcx.instrument) identity input.params
+      ccParams = optional (ccMarketParams input.cc.instrument) identity input.ccMarket
+      cbtcParams = optional (cbtcMarketParams input.cbtc.instrument) identity input.cbtcMarket
+  -- Input checks before the first transaction: a configuration error must not leave a half-done deploy
+  let problems = validateRoles roles <> validateProtocolParams params
+        <> validateMarketParams ccParams <> validateMarketParams cbtcParams
+        <> [ "debt instrument must be usdcx" | params.debtInstrument /= input.usdcx.instrument ]
+        <> [ "CC market must use the cc instrument" | ccParams.collateralInstrument /= input.cc.instrument ]
+        <> [ "CBTC market must use the cbtc instrument" | cbtcParams.collateralInstrument /= input.cbtc.instrument ]
+        <> [ "instruments must differ" | input.usdcx.instrument == input.cc.instrument
+             || input.usdcx.instrument == input.cbtc.instrument || input.cc.instrument == input.cbtc.instrument ]
+        <> [ "council threshold must be in [1, council size]"
+           | not (null input.council) && (input.councilThreshold < 1 || input.councilThreshold > length input.council) ]
+        <> [ "council members cannot hold protocol roles" | any (`elem` roleParties roles) input.council ]
+        <> [ "bootstrap prices must be positive" | any (\a -> a.bootstrapPrice <= 0.0) [input.usdcx, input.cc, input.cbtc] ]
+  unless (null problems) (abort ("deployProd input rejected: " <> show problems))
+  existing <- query @ProtocolConfig op
+  unless (null existing) (abort "a ProtocolConfig of this operator already exists: deployProd runs once")
+  now <- getTime
+  configCid <- submit op $ createCmd ProtocolConfig with
+    roles
+    governors = []
+    params
+    marketParams = Map.fromList [("CC", ccParams), ("CBTC", cbtcParams)]
+    transferFactories = Map.fromList
+      [ (a.instrument, a.transferFactory) | a <- [input.usdcx, input.cc, input.cbtc] ]
+    featuredAppRight = None
+    dso = Some input.dso
+  -- Featured App right: the operator sets it itself, the contract checks the provider and DSO
+  configCid' <- case input.featuredAppRight of
+    None -> pure configCid
+    Some right -> submit op $ exerciseCmd configCid Config_SetFeaturedAppRight with
+      newFeaturedAppRight = Some right
+  poolCid <- submit op $ createCmd Pool with
+    operator = op
+    governors = []
+    markets = Map.fromList [("CC", newMarket), ("CBTC", newMarket)]
+    state = newPoolState now
+  _ <- submit op $ createCmd PauseState with operator = op; guardian = input.guardian; flags = noPause
+  _ <- submit op $ createCmd AccountDirectory with operator = op; holders = Set.empty
+  -- Stale feeds: prices allow nothing until the oracle updates them
+  let stale = addRelTime now (hours (-1))
+  forA_ [input.usdcx, input.cc, input.cbtc] \a ->
+    submit input.oracle $ createCmd PriceFeed with
+      oracle = input.oracle; instrumentId = a.instrument
+      quotes =
+        [ PriceQuote "bootstrap-a" (toN a.bootstrapPrice) stale
+        , PriceQuote "bootstrap-b" (toN a.bootstrapPrice) stale ]
+      observers = [op]
+  _ <- submit input.oracle $ createCmd ReserveAttestation with
+    oracle = input.oracle; instrumentId = input.cbtc.instrument; coverage = 0.0
+    attestedAt = addRelTime now (days (-30)); observers = [op]
+  -- Council
+  rotationId <- if null input.council then pure None else do
+    rotationCid <- submit op $ createCmd CouncilRotation with
+      operator = op; members = []; threshold = 0; rotationId = formationId; proposer = op
+      newMembers = input.council; newThreshold = input.councilThreshold
+      expiresAt = addRelTime now (days 14); approvals = []; joined = []
+    if not input.councilHostedHere then pure (Some formationId) else do
+      joinedCid <- foldlA (\cid m -> submit m $ exerciseCmd cid Rotation_Join with joiner = m)
+        rotationCid input.council
+      _ <- submit op $ exerciseCmd joinedCid Rotation_Execute with
+        executor = op; councilCid = None; configCid = configCid'; poolCid
+      pure None
+  pure ProdDeployment with
+    operator = op; oracle = input.oracle; guardian = input.guardian; treasury = input.treasury
+    backstop = input.backstop
+    liquidator = case input.liquidators of
+      (l :: _) -> l
+      [] -> op -- unreachable: validateRoles requires a liquidator
+    liquidators = input.liquidators
+    testers = []
+    usdcx = input.usdcx.instrument; cc = input.cc.instrument; cbtc = input.cbtc.instrument
+    dso = input.dso
+    council = input.council; councilThreshold = input.councilThreshold
+    councilRotationId = rotationId
+
+-- | executeCouncilFormation input.
+data FormationInput = FormationInput
+  with
+    operator : Party
+    rotationId : Text
+  deriving (Eq, Show)
+
+-- | Adopt the formed council: all members signed Rotation_Join. The config and the pool
+-- move under the council in one operator transaction.
+executeCouncilFormation : FormationInput -> Script ()
+executeCouncilFormation input = do
+  rotations <- queryFilter @CouncilRotation input.operator
+    (\r -> r.rotationId == input.rotationId && null r.members)
+  (rotationCid, rotation) <- case rotations of
+    [r] -> pure r
+    _ -> abort ("expected exactly one formation rotation " <> input.rotationId)
+  let missing = filter (`notElem` rotation.joined) rotation.newMembers
+  unless (null missing) (abort ("council members have not joined yet: " <> show missing))
+  configs <- query @ProtocolConfig input.operator
+  pools <- query @Pool input.operator
+  case (configs, pools) of
+    ([(configCid, _)], [(poolCid, _)]) -> do
+      _ <- submit input.operator $ exerciseCmd rotationCid Rotation_Execute with
+        executor = input.operator; councilCid = None; configCid; poolCid
+      pure ()
+    _ -> abort "expected exactly one ProtocolConfig and one Pool"

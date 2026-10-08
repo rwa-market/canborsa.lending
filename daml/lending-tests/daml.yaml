@@ -1,0 +1,21 @@
+sdk-version: 3.5.12
+name: lending-tests
+source: daml
+version: 1.0.0
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - ../vendor/splice-api-token-metadata-v1-1.0.0.dar
+  - ../vendor/splice-api-token-holding-v1-1.0.0.dar
+  - ../vendor/splice-api-token-transfer-instruction-v1-1.0.0.dar
+  - ../vendor/splice-api-featured-app-v1-1.0.0.dar
+  - ../vendor/splice-test-token-v1-1.0.1.dar
+  - ../lending-core-v2/.daml/dist/lending-core-v2-1.0.3.dar
+  - ../lending-governance-v2/.daml/dist/lending-governance-v2-1.0.4.dar
+  - ../vendor/governance-action-v1-0.1.0.dar
+  - ../vendor/governance-core-v1-0.1.0.dar
+  - ../lending-decman/.daml/dist/lending-decman-0.2.5.dar
+  - ../lending-mocks/.daml/dist/lending-mocks-0.3.0.dar
+  - ../lending-deploy/.daml/dist/lending-deploy-1.0.0.dar

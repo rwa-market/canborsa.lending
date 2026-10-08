@@ -1,0 +1,29 @@
+-- | Canton application rewards (§10, T1.7.1): a Featured App activity marker on every
+-- completed money operation. The marker is created in the same transaction, so a rejected
+-- operation leaves no marker. Prices, parameters and pauses do not create markers.
+-- The FeaturedAppRight is issued by the DSO; the protocol accepts only a right where the provider is the operator
+-- and the issuing party is the DSO from the config (0.4.0, audit D-1), if the config sets it.
+module Lending.Rewards (recordActivity, checkFeaturedRight) where
+
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import Splice.Api.FeaturedAppRightV1
+
+-- | Activity marker under the right from the config. `dso`: the expected DSO from the config.
+recordActivity : Party -> Optional Party -> Optional (ContractId FeaturedAppRight) -> Update ()
+recordActivity _ _ None = pure ()
+recordActivity operator dso (Some rightCid) = do
+  checkFeaturedRight operator dso rightCid
+  _ <- exercise rightCid FeaturedAppRight_CreateActivityMarker with
+    beneficiaries = [AppRewardBeneficiary with beneficiary = operator; weight = 1.0]
+  pure ()
+
+-- | The right is issued to the operator and, if the config sets a DSO, by exactly that DSO.
+-- None in the config: a config from before 0.4.0 (sandbox, DevNet): the DSO is not checked.
+checkFeaturedRight : Party -> Optional Party -> ContractId FeaturedAppRight -> Update ()
+checkFeaturedRight operator dso rightCid = do
+  right <- fetch rightCid
+  let v = view right
+  unless (v.provider == operator) (abort "featured app right of another provider")
+  forA_ dso \expected ->
+    unless (v.dso == expected) (abort "featured app right not issued by the configured DSO")

@@ -1,0 +1,364 @@
+-- | Audit regression 2026-09-29: attacks K1, K2 and leak V1 must be rejected.
+-- Attacker templates are taken from the audit exploits unchanged.
+-- Re-audit: H1, H2, M2, M5, L8 at the end of the file. H5 and L5 were about the collateral toggle,
+-- which the Compound V3 model does not have; the liquidator payment attack is now the buyer's (K5).
+module Test.Lending.AuditRegression where
+
+import DA.Foldable (forA_)
+import DA.Map qualified as Map
+import DA.Time (addRelTime, days, hours, minutes)
+import Daml.Script
+
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight)
+import Splice.Api.Token.HoldingV1 qualified as H
+import Splice.Api.Token.MetadataV1 (emptyMetadata, emptyChoiceContext, ExtraArgs (..))
+import Splice.Api.Token.TransferInstructionV1
+
+import Lending.Account
+import Lending.Auth
+import Lending.Config
+import Lending.Governance
+import Lending.Pool
+import Lending.Token
+import Test.Lending.Env
+import Test.Lending.GovernanceTest (Council (..), setupCouncil)
+import Test.Lending.MockRewards
+
+-- | Attacker-owned "factory": claims the transfer completed, moves nothing.
+template FakeFactory
+  with
+    attacker : Party
+  where
+    signatory attacker
+    interface instance TransferFactory for FakeFactory where
+      view = TransferFactoryView with admin = attacker; meta = emptyMetadata
+      transferFactory_publicFetchImpl _ _ = pure TransferFactoryView with admin = attacker; meta = emptyMetadata
+      transferFactory_transferImpl _ _ = pure TransferInstructionResult with
+        senderChangeCids = []
+        output = TransferInstructionResult_Completed with receiverHoldingCids = []
+        meta = emptyMetadata
+
+-- | Attacker "factory" used as a PAYOUT factory (sender = operator). Its body runs
+-- with the operator's authority: it sweeps every operator holding passed in
+-- inputHoldingCids to the attacker via the real registry, then reports success.
+template DrainFactory
+  with
+    attacker : Party
+    realRules : ContractId TransferFactory
+  where
+    signatory attacker
+    interface instance TransferFactory for DrainFactory where
+      view = TransferFactoryView with admin = attacker; meta = emptyMetadata
+      transferFactory_publicFetchImpl _ _ = pure TransferFactoryView with admin = attacker; meta = emptyMetadata
+      transferFactory_transferImpl _ arg = do
+        let t = arg.transfer
+        vs <- forA t.inputHoldingCids \cid -> view <$> fetch cid
+        let total = sum (map (.amount) vs)
+        now <- getTime
+        let noArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+        r <- exercise realRules TransferFactory_Transfer with
+          expectedAdmin = t.instrumentId.admin
+          transfer = Transfer with
+            sender = t.sender            -- the operator
+            receiver = attacker
+            amount = total
+            instrumentId = t.instrumentId
+            requestedAt = now
+            executeBefore = addRelTime now (hours 1)
+            inputHoldingCids = t.inputHoldingCids
+            meta = emptyMetadata
+          extraArgs = noArgs
+        case r.output of
+          TransferInstructionResult_Pending icid -> do
+            _ <- exercise icid TransferInstruction_Accept with extraArgs = noArgs
+            pure ()
+          _ -> pure ()
+        pure TransferInstructionResult with
+          senderChangeCids = []
+          output = TransferInstructionResult_Completed with receiverHoldingCids = []
+          meta = emptyMetadata
+
+fakeArgs : ContractId TransferFactory -> TransferArgs
+fakeArgs f = TransferArgs with
+  factoryCid = f; inputHoldingCids = []; transferExtraArgs = noExtraArgs; acceptExtraArgs = noExtraArgs
+
+-- K1: supply through the attacker's factory is rejected, others' USDCx are not withdrawn
+test_fakeSupplyRejected : Script ()
+test_fakeSupplyRejected = do
+  env <- setup
+  seedLiquidity env 20000.0
+  fake <- submit env.bob $ createCmd FakeFactory with attacker = env.bob
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (accountCid, _) <- accountOf env env.bob
+  asUserMustFail env env.bob $ exerciseCmd poolCid Pool_SupplyBase with
+    user = env.bob; configCid; accountCid; amount = 1000000.0; full = False
+    payment = fakeArgs (toInterfaceContractId fake)
+
+-- K1: collateral through the attacker's factory is rejected
+test_fakeCollateralRejected : Script ()
+test_fakeCollateralRejected = do
+  env <- setup
+  fake <- submit env.carol $ createCmd FakeFactory with attacker = env.carol
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (accountCid, _) <- accountOf env env.carol
+  asUserMustFail env env.carol $ exerciseCmd poolCid Pool_SupplyCollateral with
+    user = env.carol; configCid; accountCid; marketId = "CC"; amount = 200000.0
+    payment = fakeArgs (toInterfaceContractId fake)
+
+-- K2: the factory on payout does not get operator authority
+test_payoutDrainRejected : Script ()
+test_payoutDrainRejected = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (supplyCmd env env.bob 1.0)
+  rules <- rulesFor env.usdcx
+  drain <- submit env.bob $ createCmd DrainFactory with
+    attacker = env.bob; realRules = toInterfaceContractId rules
+  payout <- transferArgs env.operator env.usdcx
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (pauseCid, _) <- currentPause env
+  (accountCid, _) <- accountOf env env.bob
+  asUserMustFail env env.bob $ exerciseCmd poolCid Pool_WithdrawBase with
+    user = env.bob; configCid; pauseCid; accountCid; amount = 1.0; full = False; allowBorrow = False
+    prices = noPrices; payout = payout with factoryCid = toInterfaceContractId drain
+  balanceOf env.operator env.usdcx >>= eqD "operator holdings intact" 20001.0
+
+-- K1: the buyer of absorbed collateral does not pay with the attacker's factory
+test_fakePurchasePaymentRejected : Script ()
+test_fakePurchasePaymentRejected = do
+  env <- setupAbsorbed
+  fake <- submit env.liquidator $ createCmd FakeFactory with attacker = env.liquidator
+  (configCid, _) <- currentConfig env
+  (poolCid, _) <- currentPool env
+  (pauseCid, _) <- currentPause env
+  ccFeed <- feedFor env env.cc
+  usdcxFeed <- feedFor env env.usdcx
+  payout <- transferArgs env.operator env.cc
+  asUserMustFail env env.liquidator $ exerciseCmd poolCid Pool_BuyCollateral with
+    buyer = env.liquidator; configCid; pauseCid; marketId = "CC"; amount = 1000.0; minCollateral = 0.0
+    collateralFeedCid = ccFeed; debtFeedCid = usdcxFeed
+    payment = fakeArgs (toInterfaceContractId fake); payout
+  balanceOf env.operator env.cc >>= eqD "collateral intact" 20000.0
+
+-- | Bob: 20 000 CC, a 1 000 loan, absorbed at CC $0.10; the liquidator holds USDCx.
+setupAbsorbed : Script Env
+setupAbsorbed = do
+  env <- setup
+  seedLiquidity env 20000.0
+  mint env env.usdcx env.liquidator 50000.0
+  run env env.bob (depositCmd env env.bob "CC" 20000.0)
+  run env env.bob (borrowCmd env env.bob 1000.0)
+  setPrice env env.cc 0.1
+  absorb env env.bob
+  pure env
+
+-- V1: guardian and treasury do not see accounts; the pool has no user list
+test_rolesDoNotSeeAccounts : Script ()
+test_rolesDoNotSeeAccounts = do
+  env <- setupAbsorbed
+  setPauseFlags env (\f -> f with borrowPaused = True)
+  forA_ [env.guardian, env.treasury, env.oracle, env.liquidator, env.backstop, env.alice] \p -> do
+    accounts <- queryFilter @Account p (\a -> a.owner /= p)
+    assertMsg "no foreign accounts visible" (null accounts)
+
+-- V1: a repeated account request is rejected by the operator
+test_secondAccountRejected : Script ()
+test_secondAccountRejected = do
+  env <- setup
+  requestCid <- submit env.bob $ createCmd AccountRequest with operator = env.operator; user = env.bob
+  directoryCid <- currentDirectory env
+  submitMustFail env.operator $ exerciseCmd directoryCid Directory_Open with requestCid
+  submit env.operator $ exerciseCmd directoryCid Directory_Reject with requestCid
+
+-- Re-audit 2026-09-29 -----------------------------------------------------------
+-- Auditor PoCs (scratchpad ReAudit.daml), inverted: the attack must be rejected.
+-- H3 (shared holdings in bids) and H4 are backend bots; they cannot be checked in Daml.
+
+-- | Attacker factory that passes verifyReceived: the receiver gets exactly
+-- the transfer amount, the rest of the inputs goes to the attacker (PoC H1).
+template SmartDrain
+  with
+    attacker : Party
+    realRules : ContractId TransferFactory
+  where
+    signatory attacker
+    interface instance TransferFactory for SmartDrain where
+      view = TransferFactoryView with admin = attacker; meta = emptyMetadata
+      transferFactory_publicFetchImpl _ _ = pure TransferFactoryView with admin = attacker; meta = emptyMetadata
+      transferFactory_transferImpl _ arg = do
+        let t = arg.transfer
+            noArgs = ExtraArgs with context = emptyChoiceContext; meta = emptyMetadata
+        vs <- forA t.inputHoldingCids \cid -> view <$> fetch cid
+        now <- getTime
+        let mk receiver amount inputs = Transfer with
+              sender = t.sender; receiver; amount; instrumentId = t.instrumentId
+              requestedAt = now; executeBefore = addRelTime now (hours 1)
+              inputHoldingCids = inputs; meta = emptyMetadata
+        r1 <- exercise realRules TransferFactory_Transfer with
+          expectedAdmin = t.instrumentId.admin
+          transfer = mk attacker (sum (map (.amount) vs) - t.amount) t.inputHoldingCids
+          extraArgs = noArgs
+        case r1.output of
+          TransferInstructionResult_Pending icid -> () <$ exercise icid TransferInstruction_Accept with extraArgs = noArgs
+          _ -> pure ()
+        exercise realRules TransferFactory_Transfer with
+          expectedAdmin = t.instrumentId.admin
+          transfer = mk t.receiver t.amount r1.senderChangeCids
+          extraArgs = noArgs
+
+-- | Council proposal based on the current config.
+proposeChange : Env -> Council -> Text -> Optional TransferFactories -> Optional FeaturedRightChange
+  -> Script (ContractId ParameterChangeProposal)
+proposeChange env c proposalId newTransferFactories featuredAppRightChange = do
+  (configCid, config) <- currentConfig env
+  now <- getTime
+  submit c.m1 $ exerciseCmd c.cid Council_Propose with
+    proposer = c.m1; proposalId; description = proposalId; configCid
+    newParams = config.params; newMarketParams = config.marketParams
+    newTransferFactories; expiresAt = addRelTime now (days 1); featuredAppRightChange; newRoles = None
+
+approve : Party -> ContractId ParameterChangeProposal -> Script (ContractId ParameterChangeProposal)
+approve member p = submit member $ exerciseCmd p Proposal_Approve with approver = member
+
+-- H1: a 2-of-3 council does not install its own factory without the operator.
+-- 0.4.0, audit D-5: the trusted path is the approval threshold plus the operator's signature, not the whole council,
+-- so that one member's lost key does not block factory rotation forever.
+-- L8: a factory change from a stale base is rejected.
+test_reaudit_councilThresholdCannotInstallFactory : Script ()
+test_reaudit_councilThresholdCannotInstallFactory = do
+  env <- setup
+  seedLiquidity env 20000.0
+  run env env.bob (supplyCmd env env.bob 1.0)
+  c <- setupCouncil env
+  rules <- rulesFor env.usdcx
+  drain <- submit c.m1 $ createCmd SmartDrain with attacker = c.m1; realRules = toInterfaceContractId rules
+  (_, config) <- currentConfig env
+  let evil = Map.insert env.usdcx (toInterfaceContractId drain) config.transferFactories
+  p <- proposeChange env c "rotate-usdcx-factory" (Some evil) None
+  (configCid, _) <- currentConfig env
+  -- one approval: the operator does not execute
+  submitMustFail env.operator $ exerciseCmd p Proposal_ExecuteTrusted with configCid; pauseCid = None
+  p' <- approve c.m2 p
+  -- threshold reached, but the factory cannot be changed by threshold without the operator
+  submitMustFail c.m2 $ exerciseCmd p' Proposal_Execute with executor = c.m2; configCid
+  -- council members do not execute the trusted path instead of the operator, even all together
+  p'' <- approve c.m3 p'
+  submitMustFail c.m3 $ exerciseCmd p'' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  submitMustFail (actAs [c.m1, c.m2, c.m3]) $ exerciseCmd p'' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  (_, unchanged) <- currentConfig env
+  assertMsg "factories unchanged" (unchanged.transferFactories == config.transferFactories)
+  balanceOf env.operator env.usdcx >>= eqD "operator holdings intact" 20001.0
+  -- threshold and operator rotate; the second proposal from the old base is stale
+  q <- proposeChange env c "rotate-again" (Some evil) None
+  q' <- approve c.m2 q
+  _ <- submit env.operator $ exerciseCmd p'' Proposal_ExecuteTrusted with configCid; pauseCid = None
+  (configCid', rotated) <- currentConfig env
+  assertMsg "factory rotated by threshold and operator" (rotated.transferFactories == evil)
+  submitMustFail env.operator $ exerciseCmd q' Proposal_ExecuteTrusted with configCid = configCid'; pauseCid = None
+
+-- H2: DSO revoked the Featured App right; the operator removes it, operations resume.
+-- The council removes a right by threshold, but sets a new one only unanimously with the operator.
+test_reaudit_revokedFeaturedRightRecoverable : Script ()
+test_reaudit_revokedFeaturedRightRecoverable = do
+  env <- setup
+  seedLiquidity env 20000.0
+  dso <- allocateParty "DSO"
+  right <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = env.operator
+  (configCid, config) <- currentConfig env
+  _ <- submit env.operator $ exerciseCmd configCid Config_Update with
+    newParams = config.params; newMarketParams = config.marketParams; newTransferFactories = None
+    newFeaturedAppRight = Some (toInterfaceContractId @FeaturedAppRight right); newRoles = None
+  c <- setupCouncil env
+  run env env.bob (supplyCmd env env.bob 10.0)
+  submit dso $ archiveCmd right
+  mustFail env env.bob (supplyCmd env env.bob 10.0)
+  mustFail env env.alice (withdrawCmd env env.alice 10.0)
+  -- the operator alone removes the dead right, the config stays under the council
+  (configCid1, _) <- currentConfig env
+  submitMustFail c.m1 $ exerciseCmd configCid1 Config_SetFeaturedAppRight with newFeaturedAppRight = None
+  _ <- submit env.operator $ exerciseCmd configCid1 Config_SetFeaturedAppRight with newFeaturedAppRight = None
+  (_, cleared) <- currentConfig env
+  assertMsg "right cleared, council kept" (cleared.featuredAppRight == None && cleared.governors == [c.m1, c.m2, c.m3])
+  run env env.bob (supplyCmd env env.bob 10.0)
+  run env env.alice (withdrawCmd env env.alice 10.0)
+  -- new right: not by threshold without the operator, allowed by threshold with the operator (0.4.0)
+  right2 <- submit dso $ createCmd MockFeaturedAppRight with dso; provider = env.operator
+  let rightCid2 = toInterfaceContractId @FeaturedAppRight right2
+  p <- proposeChange env c "new-right" None (Some (FeaturedRight_Set rightCid2))
+  p' <- approve c.m2 p
+  (configCid2, _) <- currentConfig env
+  submitMustFail c.m2 $ exerciseCmd p' Proposal_Execute with executor = c.m2; configCid = configCid2
+  _ <- submit env.operator $ exerciseCmd p' Proposal_ExecuteTrusted with configCid = configCid2; pauseCid = None
+  (_, withRight) <- currentConfig env
+  assertMsg "new right installed" (withRight.featuredAppRight == Some rightCid2)
+  run env env.bob (supplyCmd env env.bob 10.0)
+  -- the council can remove the right by threshold
+  submit dso $ archiveCmd right2
+  q <- proposeChange env c "clear-right" None (Some FeaturedRight_Clear)
+  q' <- approve c.m2 q
+  (configCid3, _) <- currentConfig env
+  _ <- submit c.m2 $ exerciseCmd q' Proposal_Execute with executor = c.m2; configCid = configCid3
+  (_, final) <- currentConfig env
+  assertMsg "right cleared by the council" (final.featuredAppRight == None)
+  run env env.bob (supplyCmd env env.bob 10.0)
+
+-- M2: dust does not recreate Pool; "withdraw all" and "repay all" work for any amount.
+test_reaudit_dustOperationsRejected : Script ()
+test_reaudit_dustOperationsRejected = do
+  env <- setup
+  seedLiquidity env 20000.0
+  aliceCmd <- supplyCmd env env.alice 10.0
+  mustFail env env.bob (supplyCmd env env.bob 0.0000000001)
+  _ <- asUser env env.alice aliceCmd
+  -- boundary: exactly the minimum passes, one step less does not
+  mustFail env env.bob (supplyCmd env env.bob 0.9999999999)
+  run env env.bob (supplyCmd env env.bob 1.0)
+  run env env.bob (supplyCmd env env.bob 1.0)
+  -- partial withdrawal below the minimum is rejected, withdrawing everything passes
+  mustFail env env.bob (withdrawCmd env env.bob 0.5)
+  run env env.bob (withdrawAllCmd env env.bob)
+  balanceFor env env.bob >>= approxEq "deposit withdrawn" 0.0 0.0
+  -- collateral: the minimum deposit in asset units (CC: 10)
+  mustFail env env.bob (depositCmd env env.bob "CC" 9.9999999999)
+  run env env.bob (depositCmd env env.bob "CC" 10.0)
+  run env env.bob (depositCmd env env.bob "CC" 10000.0)
+  mustFail env env.bob (withdrawCollateralCmd env env.bob "CC" 9.9999999999)
+  -- repaying the whole debt and withdrawing all collateral are allowed with any remainder
+  run env env.bob (borrowCmd env env.bob 500.0)
+  run env env.bob (repayAllCmd env env.bob 600.0)
+  balanceFor env env.bob >>= approxEq "debt closed" 0.0 0.0
+  run env env.bob (withdrawCollateralCmd env env.bob "CC" 10010.0)
+  collateralFor env env.bob "CC" >>= approxEq "collateral withdrawn" 0.0 0.0
+  -- a debt is repaid exactly: a partial repayment leaves a debt below the minimum, full closes it
+  run env env.carol (depositCmd env env.carol "CC" 10000.0)
+  run env env.carol (borrowCmd env env.carol 250.0)
+  mint env env.usdcx env.carol 300.0
+  run env env.carol (supplyCmd env env.carol 249.5)
+  run env env.carol (repayAllCmd env env.carol 1.0)
+  balanceFor env env.carol >>= approxEq "sub-minimum debt repaid in full" 0.0 0.0
+
+-- M5: an expired Login is not redeemed for a session; the operator reaps abandoned logins.
+test_reaudit_loginExpiry : Script ()
+test_reaudit_loginExpiry = do
+  env <- setup
+  now <- getTime
+  fresh <- submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "n1"; expiresAt = Some (addRelTime now (minutes 5))
+  submitMustFail env.operator $ exerciseCmd fresh Login_Expire
+  submitMustFail env.bob $ exerciseCmd fresh Login_Expire
+  stale <- submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "n2"; expiresAt = Some (addRelTime now (minutes 5))
+  legacy <- submit env.bob $ createCmd Login with
+    user = env.bob; operator = env.operator; nonce = "n3"; expiresAt = None
+  nonce <- submit env.operator $ exerciseCmd fresh Login_Consume
+  assertMsg "nonce returned" (nonce == "n1")
+  passTime (minutes 5)
+  submitMustFail env.operator $ exerciseCmd stale Login_Consume
+  submit env.operator $ exerciseCmd stale Login_Expire
+  submit env.operator $ exerciseCmd legacy Login_Expire
+  logins <- query @Login env.operator
+  assertMsg "no logins left" (null logins)
+

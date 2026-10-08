@@ -1,0 +1,129 @@
+-- | Prices and reserve attestations on ledger (T1.5.1–T1.5.3, spec §6).
+module Lending.Oracle where
+
+
+import DA.Foldable (maximum, minimum)
+import DA.List (dedup)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Lending.Math
+import Lending.Types
+
+-- | Price from one source.
+data PriceQuote = PriceQuote
+  with
+    source : Text
+    price : N
+      -- ^ USD per unit of the instrument
+    observedAt : Time
+  deriving (Eq, Show)
+
+-- | For collateral take the lower price, for debt the higher (ADR-001, D5).
+data PriceSide = CollateralSide | DebtSide
+  deriving (Eq, Show)
+
+-- | Current price of an instrument. Published only by the oracle.
+template PriceFeed
+  with
+    oracle : Party
+    instrumentId : InstrumentId
+    quotes : [PriceQuote]
+    observers : [Party]
+  where
+    signatory oracle
+    observer observers
+    ensure not (null quotes) && all (\q -> q.price > 0.0) quotes
+
+    choice PriceFeed_Update : ContractId PriceFeed
+      with
+        newQuotes : [PriceQuote]
+      controller oracle
+      do create this with quotes = newQuotes
+
+-- | Reserve coverage (CBTC Proof of Reserve). 1.0 = 100%.
+template ReserveAttestation
+  with
+    oracle : Party
+    instrumentId : InstrumentId
+    coverage : N
+    attestedAt : Time
+    observers : [Party]
+  where
+    signatory oracle
+    observer observers
+    ensure coverage >= 0.0
+
+    choice ReserveAttestation_Update : ContractId ReserveAttestation
+      with
+        newCoverage : N
+        newAttestedAt : Time
+      controller oracle
+      do create this with coverage = newCoverage; attestedAt = newAttestedAt
+
+-- | Check that the feed belongs to the expected oracle and instrument.
+checkFeed : Party -> InstrumentId -> PriceFeed -> Either Text ()
+checkFeed oracle instrumentId feed
+  | feed.oracle /= oracle = Left "price feed: wrong oracle"
+  | feed.instrumentId /= instrumentId = Left "price feed: wrong instrument"
+  | otherwise = Right ()
+
+-- | Price for risk-increasing operations: borrow and collateral withdrawal.
+-- Needs two different sources, each no older than maxPriceAgeSeconds and not from the future
+-- beyond maxClockSkewSeconds, deviation no more than maxSourceDeviation (audit S4).
+validPrice : ProtocolParams -> Time -> PriceSide -> PriceFeed -> Either Text N
+validPrice params = checkedPrice params.maxSourceDeviation params
+
+-- | Price for liquidation (audit K1). Liquidation reduces risk, so source deviation
+-- is allowed up to maxLiquidationSourceDeviation: in a crash sources diverge, and the borrow threshold
+-- would stop liquidations when they are needed most. The price side is the same: conservative.
+-- Freshness and quotes from the future are checked just as strictly.
+validLiquidationPrice : ProtocolParams -> Time -> PriceSide -> PriceFeed -> Either Text N
+validLiquidationPrice params = checkedPrice params.maxLiquidationSourceDeviation params
+
+checkedPrice : N -> ProtocolParams -> Time -> PriceSide -> PriceFeed -> Either Text N
+checkedPrice maxDeviation params now side feed
+  | length (dedup (map (.source) feed.quotes)) < 2 = Left "price feed: at least two distinct sources required"
+  | length (dedup (map (.source) feed.quotes)) /= length feed.quotes = Left "price feed: duplicate source"
+  | any (\q -> secondsBetween now q.observedAt > params.maxClockSkewSeconds) feed.quotes =
+      Left "price feed: quote from the future"
+  | any (\q -> secondsBetween q.observedAt now > params.maxPriceAgeSeconds) feed.quotes =
+      Left "price feed: stale price"
+  | divN (hi - lo) lo > maxDeviation = Left "price feed: sources deviate"
+  | otherwise = Right (if side == CollateralSide then lo else hi)
+  where
+    prices = map (.price) feed.quotes
+    lo = minimum prices
+    hi = maximum prices
+
+-- | Midpoint of quotes: collateral price for the seizure size in liquidation (0.4.0, audit D-4).
+-- The lower quote decides whether liquidation starts, but we seize at the midpoint: the liquidator does not get
+-- a "higher / lower − 1" discount on top of the bonus, yet in a crash, when the higher
+-- quote lags, liquidation stays profitable while the deviation is below two bonuses.
+-- Call after validLiquidationPrice: freshness and deviation are already checked.
+midPrice : PriceFeed -> N
+midPrice feed = divN (minimum prices + maximum prices) 2.0
+  where prices = map (.price) feed.quotes
+
+-- | Price for the exposure limit on deposit (T1.3.1): no freshness check so that deposit
+-- works with a stale price, but the higher of the quotes, so the limit is not understated (audit S12).
+exposurePrice : PriceFeed -> N
+exposurePrice feed = maximum (map (.price) feed.quotes)
+
+-- | USDCx must not deviate from 1 by more than maxDebtDepeg (§6).
+checkDebtPeg : ProtocolParams -> N -> Either Text ()
+checkDebtPeg params debtPrice
+  | absN (debtPrice - 1.0) > params.maxDebtDepeg = Left "debt asset depegged: new borrowing paused"
+  | otherwise = Right ()
+
+-- | Borrowing against CBTC requires a fresh attestation with coverage no lower than the minimum (§6).
+checkReserve : Party -> MarketParams -> Time -> Optional ReserveAttestation -> Either Text ()
+checkReserve oracle m now att
+  | not m.requiresReserveAttestation = Right ()
+  | otherwise = case att of
+      None -> Left "reserve attestation required"
+      Some a
+        | a.oracle /= oracle -> Left "reserve attestation: wrong oracle"
+        | a.instrumentId /= m.collateralInstrument -> Left "reserve attestation: wrong instrument"
+        | secondsBetween a.attestedAt now > m.maxAttestationAgeSeconds -> Left "reserve attestation: stale"
+        | a.coverage < m.minReserveCoverage -> Left "reserve coverage below required level: borrowing paused"
+        | otherwise -> Right ()
