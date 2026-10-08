@@ -1,12 +1,93 @@
 # Canton Lending Protocol
 
-Pooled lending on Canton Network, Compound V3-style. Suppliers deposit USDCx and earn yield; borrowers post CC or CBTC as collateral and borrow USDCx. Each account has one USDCx balance (positive: a deposit, negative: a debt) backed by all of its collateral. An undercollateralized account is absorbed by the protocol, which then sells the collateral at a discount. Every money check (borrow capacity, liquidation point, caps, price validity) is enforced by Daml contracts; off-chain services prepare and initiate operations. One exception, stated plainly: Loop wallets are custodial (see "Loop only for users" below). Their Ed25519 signature is verified by the backend, which then submits as the custody party; the contract binds the operation to the signed text, nonce and expiry but cannot check the signature itself.
+Submitted to HackCanton S3 as **Canborsa Lending**: Financial Applications track and the BitSafe
+Contribution Pool. Live on Canton DevNet: https://lending.canborsa.com
 
-Built for HackCanton S3, Financial Applications track. Live on Canton DevNet: https://lending.canborsa.com
+A USDCx lending market on Canton Network. Holders of CC or CBTC post it as collateral and borrow
+USDCx without selling it. USDCx holders supply the pool and earn the interest that borrowers pay.
+The first users it is built for are small node operators and app teams whose treasury is in CC and
+whose costs are in dollars.
+
+The mechanics follow Compound V3. Each account has one USDCx balance (positive: a deposit,
+negative: a debt) backed by all of its collateral. An undercollateralized account is absorbed by
+the protocol, which then sells the collateral at a discount. Every money check (borrow capacity,
+liquidation point, caps, price validity) is enforced by Daml contracts; off-chain services prepare
+and initiate operations. One exception: Loop accounts are custodial. The backend verifies the Loop
+signature and submits as the custody party, because the contract cannot check that signature itself
+(see "Loop only for users" below).
 
 All code in this repository was written during the hackathon, from the first commit on 29.09.2026.
 The team built it with AI coding agents (Claude Code, OpenAI Codex): they wrote most of the code,
 tests and docs to the team's specs, and the team reviewed the changes and ran the checks below.
+
+## Try it on DevNet
+
+1. Open https://lending.canborsa.com. Without a wallet the Markets page shows the rates, the
+   liquidity, the collateral parameters and the interest rate model.
+2. Press **Connect wallet**. Loop opens in a popup, or shows a QR code for the phone app. On DevNet
+   it is https://devnet.cantonloop.com; if you have no wallet, sign up there, for example with
+   Google.
+3. Take test tokens with the **Get test CC**, **Get test CBTC** and **Get test USDCx** links on the
+   dashboard. Each link gives a fixed portion, a few times a day. The tokens come from this app's own
+   test registries: the same ticker inside Loop is a different asset.
+4. To borrow, press **+** next to CC or CBTC to post collateral, then **Borrow USDCx**. The minimum
+   loan is 250 USDCx. Position Summary shows the borrow capacity, the liquidation point and the
+   liquidation risk.
+5. To earn, press **Supply USDCx**. The deposit earns the supply APR until **Withdraw USDCx**.
+6. Close the loan with **Repay USDCx**, then press **−** to take the collateral back.
+
+Every operation is a text you read and sign in Loop. The History page lists what happened to the
+account.
+
+## Economics and incentives
+
+Borrowers pay interest on USDCx. Lenders receive 80% of it and 20% stays in the protocol's reserves.
+
+| Rule          | Value                                                               |
+| ------------- | ------------------------------------------------------------------- |
+| Borrow rate   | 2% a year at zero utilization, 10% at 65%, 35.7% at the 80% ceiling |
+| Supply rate   | Borrow rate × utilization × 80%: 5.2% at 65% utilization            |
+| Launch limits | 50,000 USDCx of total debt, 5,000 per account, 250 minimum loan     |
+
+| Collateral | Borrow up to     | Liquidated when debt passes | Penalty | Buyer's discount | Collateral cap |
+| ---------- | ---------------- | --------------------------- | ------- | ---------------- | -------------- |
+| CC         | 30% of its value | 45% of its value            | 7%      | 5.6%             | 400,000 CC     |
+| CBTC       | 50% of its value | 65% of its value            | 5%      | 4%               | 0.58 CBTC      |
+
+| Who          | What they get and what they risk                                                                                                                                                  |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Borrowers    | Keep their CC or CBTC and see the rate before they borrow; it floats with utilization. A loan at the 30% limit is liquidated if CC falls by a third                               |
+| Lenders      | Earn what borrowers pay. There are no token rewards                                                                                                                               |
+| Buyers       | Take liquidated collateral below the oracle price while reserves are under the 50,000 USDCx target                                                                                |
+| The protocol | Keeps 20% of the interest and a fifth of each penalty in reserves. Bad debt comes out of reserves first. If they go negative, new loans and deposit withdrawals wait for a top-up |
+
+These are the DevNet values. The council changes them by vote.
+
+## Network activity
+
+- Each user action (supply, withdraw, borrow, repay, post or take back collateral) is one Canton
+  transaction: one choice on `Pool` that settles the Token Standard transfer and the accounting
+  together. A loan from start to finish is at least four transactions.
+- A liquidation adds two: the absorb and the purchase of the collateral.
+- The oracle publishes a price feed per asset with quotes from at least two sources, at least every
+  4 minutes: about 1,000 updates a day for three assets. The contract rejects a quote older than
+  5 minutes.
+- Measured on LocalNet (Splice 0.6.12), a pool operation costs 5.3 to 6.8 KB of sequencer traffic,
+  about $0.09 to $0.11 at the MainNet extra-traffic price. The numbers per operation are in
+  [deploy/BITSAFE-LOCALNET.md](deploy/BITSAFE-LOCALNET.md).
+- User operations and collateral purchases record a Featured App activity marker when the operator
+  holds the right. On DevNet this is a test right from `lending-mocks`.
+
+## Status and limits
+
+- DevNet only, with test tokens from the app's own registries. There has been no external security
+  audit.
+- Loop accounts are custodial: see "Loop only for users" below.
+- Prices come from the operator's oracle, which reads CoinGecko, KuCoin, Binance and Bybit. MainNet
+  needs a feed that can be verified on the ledger.
+- Absorbs are started by the operator's bot, because on Canton only the operator sees positions.
+- On DevNet the council is three ordinary parties. The BitSafe Decentralized Party runs on
+  LocalNet: see "BitSafe Decentralization Manager demo" below.
 
 ## Layout
 
@@ -60,9 +141,9 @@ flowchart LR
   Ed25519 check) and submits as custody; the contract checks the nonce, the expiry, that the text
   matches the operation and that the key is the party's namespace key. So for Loop accounts the
   custody operator is trusted not to submit operations the user did not sign; the frontend
-  protects against a tampered response by signing only text that matches the user's input. Service roles (guardian, treasury,
-  council) sign in with their Canton node account on `/operator`. The trust model is in the
-  team's ADR-006 (Loop wallet), kept outside this repository.
+  protects against a tampered response by signing only text that matches the user's input. Service
+  roles (guardian, treasury, council) sign in with their Canton node account on `/operator`. The
+  trust model is in the team's ADR-006 (Loop wallet), kept outside this repository.
 - The operator party holds pooled tokens. Each user action is one choice on `Pool`; the choice
   body carries the user's (or custody's) and the operator's authority, so a Token Standard
   transfer and its acceptance settle in the same transaction as the accounting update.
@@ -81,7 +162,7 @@ flowchart LR
   (`GovernableAction`): parameters, roles, factories, market listing, protocol income, council
   rotation. A change that needs the operator is only proposed by the vote; the operator executes it,
   as with the regular council. The party sees the config and the proposals, not accounts or the pool.
-- Prices: the oracle takes CoinGecko, KuCoin and Binance, publishes the median of agreeing
+- Prices: the oracle takes CoinGecko, KuCoin, Binance and Bybit, publishes the median of agreeing
   sources and holds large jumps until they are confirmed.
 
 ### What differs from Compound V3
@@ -91,12 +172,12 @@ flowchart LR
 | Who absorbs           | Anyone                                           | The operator                                                                                                    | Positions on Canton are private: only the operator sees them |
 | Who buys collateral   | Anyone                                           | Approved buyers (liquidators, backstop)                                                                         | The buyer never learns whose position it was                 |
 | Withdraw and borrow   | One action: withdrawing past the deposit borrows | Two different signed texts: Withdraw and Borrow                                                                 | A Loop user signs text and must see they take a debt         |
-| Pauses                | Five flags; a supply pause also blocks repayment | Five flags in their own contract; supply and repayment never pause                                              | Spec §11                                                     |
+| Pauses                | Five flags; a supply pause also blocks repayment | Five flags in their own contract; supply and repayment never pause                                              | A user can always add funds and repay                        |
 | Minimum collateral    | None                                             | A collateral deposit or partial withdrawal moves at least `minCollateralAmount`; withdraw-all is always allowed | Tiny operations contend for the one pool contract            |
 | Prices                | One feed per asset                               | Two sources, deviation and freshness checks                                                                     | Stricter than Compound                                       |
 | Launch limits         | None                                             | Total borrow cap, per-user cap, 80% utilization ceiling                                                         | Careful launch; lifted by a parameter                        |
 | Negative reserves     | The protocol carries on                          | New loans and deposit withdrawals wait for recapitalization                                                     | Losses are not spread onto suppliers automatically           |
-| CBTC proof of reserve | None                                             | Without a fresh attestation CBTC adds no borrow capacity                                                        | Spec §6                                                      |
+| CBTC proof of reserve | None                                             | Without a fresh attestation CBTC adds no borrow capacity                                                        | Borrowing against CBTC needs proof that it is backed         |
 | Governance delay      | A 2-day timelock on every change                 | 2 days only for a lower liquidation factor; the rest applies at once                                            | Absorb takes all collateral: borrowers get time to react     |
 | Service features      | COMP rewards, transfers, managers, bulk actions  | None                                                                                                            | Not needed for launch; every Loop operation is signed alone  |
 
@@ -129,7 +210,7 @@ pnpm doctor   # checks the toolchain
 
 ## Run it yourself
 
-Live stand: https://lending.canborsa.com (Canton DevNet). To check the code without DevNet access:
+To check the code without DevNet access:
 
 ```bash
 pnpm install
@@ -154,7 +235,7 @@ parameter, market, income, rotation and delisting changes.
 
 - **Where it runs.** On LocalNet with a real Decentralized Party created by DecMan's own onboarding:
   `pnpm demo:bitsafe:localnet`, runbook with commands from a clean clone, resource needs and the
-  log of a full run in [deploy/BITSAFE-LOCALNET.md](deploy/BITSAFE-LOCALNET.md) (about 8 minutes,
+  log of a full run in [deploy/BITSAFE-LOCALNET.md](deploy/BITSAFE-LOCALNET.md) (about 13 minutes,
   Docker with 7–8 GB). The vote lowers the CBTC Collateral Factor 0.5 → 0.45, a 50% borrow is then
   rejected and a 45% borrow accepted; a second change is voted through the DecMan HTTP API.
 - **Without LocalNet.** `pnpm demo:bitsafe` runs the same flows on an in-memory Daml ledger.
@@ -176,7 +257,7 @@ cd backend && node --env-file=.env.devnet --import tsx src/server.ts
 cd frontend && pnpm dev              # :5173, /api → backend :3001
 ```
 
-Open http://localhost:5173, press **Connect wallet**, pick a browser wallet, sign in, and take
+Open http://localhost:5173, press **Connect wallet**, sign in with Loop, and take
 test tokens from the faucet. **Canton node** signs in with the node account (protocol roles).
 
 DevNet operations: `python3 scripts/devnet.py status|retire|deploy`,
@@ -193,6 +274,9 @@ pnpm format:check
 pnpm daml:test && sh scripts/daml.sh upgrade-check
 pnpm --filter @lending/frontend exec playwright test e2e/loop.spec.ts  # against vite dev, mocked SDK and API
 ```
+
+On the build of 08.10.2026: 142 Daml Script scenarios, 400 backend tests, 134 frontend tests and
+9 browser tests pass.
 
 `e2e/loop.spec.ts` replaces the Loop SDK and the API with mocks, so it needs no secrets.
 `e2e/devnet.spec.ts` needs `E2E_NODE_USER` and `E2E_NODE_PASSWORD`. CI runs lint, types, unit and

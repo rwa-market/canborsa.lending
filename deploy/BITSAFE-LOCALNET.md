@@ -36,8 +36,9 @@ For the BitSafe challenge judges. The log excerpts below come from the clean run
 
 `ProtocolConfig` holds the lending risk parameters: Collateral Factor (`borrowCollateralFactor`),
 liquidation factor, rate model, caps. Whoever changes it controls every open loan. If one key can
-lower the CBTC Collateral Factor from 0.5 to 0.3, each borrower above 30% loan-to-value becomes
-liquidatable at once. The second risk is availability: if the council lives on one
+lower the CBTC Collateral Factor from 0.5 to 0.3, no borrower above 30% loan-to-value can borrow
+more or withdraw collateral. The same key could lower the liquidation factor, and after its 2-day
+delay those borrowers would be liquidated. The second risk is availability: if the council lives on one
 node, that node going down stops governance. The run shows a third point we did not expect: it
 stops users too, because every supply and borrow reads the council-signed config.
 
